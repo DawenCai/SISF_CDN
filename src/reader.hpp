@@ -2060,23 +2060,15 @@ public:
         return std::make_tuple(size_x_out, size_y_out, size_z_out);
     }
 
+    // A level's voxel size: scale times level 1's, on every axis. Level-scale
+    // voxel i of an mchunk holds that mchunk's full-resolution voxels
+    // [scale*i, scale*(i+1)), so a viewer that places voxel i at i times this
+    // size draws it where it was written. The size used to be level 1's extent
+    // over this level's voxel count, which is larger whenever an axis is not a
+    // multiple of scale, so such a level was drawn stretched.
     std::tuple<size_t, size_t, size_t> get_res(size_t scale)
     {
-        std::tuple<size_t, size_t, size_t> size = this->get_size(scale);
-
-        double resx_out = resx;
-        double resy_out = resy;
-        double resz_out = resz;
-
-        resx_out *= sizex;
-        resy_out *= sizey;
-        resz_out *= sizez;
-
-        resx_out /= std::get<0>(size);
-        resy_out /= std::get<1>(size);
-        resz_out /= std::get<2>(size);
-
-        return std::make_tuple((size_t)resx_out, (size_t)resy_out, (size_t)resz_out);
+        return std::make_tuple((size_t)(resx * scale), (size_t)(resy * scale), (size_t)(resz * scale));
     }
 
     bool contains_scale(size_t scale)
