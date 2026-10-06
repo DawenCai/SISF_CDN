@@ -2060,15 +2060,32 @@ public:
         return std::make_tuple(size_x_out, size_y_out, size_z_out);
     }
 
-    // A level's voxel size: scale times level 1's, on every axis. Level-scale
-    // voxel i of an mchunk holds that mchunk's full-resolution voxels
-    // [scale*i, scale*(i+1)), so a viewer that places voxel i at i times this
-    // size draws it where it was written. The size used to be level 1's extent
-    // over this level's voxel count, which is larger whenever an axis is not a
-    // multiple of scale, so such a level was drawn stretched.
+    // A level's voxel size on one axis. Level-scale voxel i of an mchunk holds
+    // that mchunk's full-resolution voxels [scale*i, scale*(i+1)). Where the
+    // mchunks laid end to end keep that grid (one mchunk on the axis, or an
+    // mchunk that is a multiple of scale), scale times level 1's voxel places
+    // every voxel where it was written, so that is declared. Elsewhere each
+    // mchunk leaves out its last (mchunk mod scale) voxels and the grid steps
+    // back at every mchunk boundary; no single size is exact there, and the
+    // axis keeps level 1's extent over the level's voxel count, which spreads
+    // that error over the axis instead of letting it grow mchunk by mchunk. So
+    // does an axis this level holds in one voxel (a plane is never thinned in
+    // Z): that voxel covers the whole axis, which only the old size describes.
+    static size_t level_res(uint64_t res1, uint64_t size1, uint64_t mchunk, uint64_t mcount, size_t size_s, size_t scale)
+    {
+        if (size_s >= 2 && (mcount == 1 || mchunk % scale == 0))
+        {
+            return (size_t)(res1 * scale);
+        }
+        return (size_t)((double)res1 * size1 / size_s);
+    }
+
     std::tuple<size_t, size_t, size_t> get_res(size_t scale)
     {
-        return std::make_tuple((size_t)(resx * scale), (size_t)(resy * scale), (size_t)(resz * scale));
+        std::tuple<size_t, size_t, size_t> size = this->get_size(scale);
+        return std::make_tuple(level_res(resx, sizex, mchunkx, mcountx, std::get<0>(size), scale),
+                               level_res(resy, sizey, mchunky, mcounty, std::get<1>(size), scale),
+                               level_res(resz, sizez, mchunkz, mcountz, std::get<2>(size), scale));
     }
 
     bool contains_scale(size_t scale)
