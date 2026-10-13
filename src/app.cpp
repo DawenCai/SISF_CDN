@@ -2401,6 +2401,13 @@ int main(int argc, char *argv[])
 				out_of_range |= y_end > std::get<1>(image_size);
 				out_of_range |= z_end > std::get<2>(image_size);
 			}
+			// Each axis must run forward: a reversed box (begin after end)
+			// would wrap chunk_sizes to a huge size, and an empty one (begin
+			// equal to end) reads nothing, so both are refused like a box
+			// past the image.
+			out_of_range |= x_begin >= x_end;
+			out_of_range |= y_begin >= y_end;
+			out_of_range |= z_begin >= z_end;
 
 			if (out_of_range)
 			{
@@ -2717,6 +2724,12 @@ int main(int argc, char *argv[])
 				strict_read ? &read_failed : nullptr,
 				channel
 			);
+			if (out_buffer == NULL)
+			{
+				res.code = crow::status::INTERNAL_SERVER_ERROR;
+				res.end("500 Internal Server Error -- Out of memory\n");
+				return;
+			}
 		}
 
 		if (read_failed)
