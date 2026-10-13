@@ -2355,9 +2355,12 @@ int main(int argc, char *argv[])
 		// 	return;
 		// }
 
-		unsigned int x_begin, x_end, y_begin, y_end, z_begin, z_end;
-		// <xBegin>-<xEnd>_<yBegin>-<yEnd>_<zBegin>-<zEnd>
-		if (sscanf(tile_key.c_str(), "%u-%u_%u-%u_%u-%u", &x_begin, &x_end, &y_begin, &y_end, &z_begin, &z_end) != 6)
+		// <xBegin>-<xEnd>_<yBegin>-<yEnd>_<zBegin>-<zEnd>. Read as size_t:
+		// %u keeps only the low 32 bits of a larger number, which turned
+		// 3-4294967298 into the reversed box 3-2 and 0-4294967297 into 0-1.
+		// A coordinate that large is past the image and refused below.
+		size_t x_begin, x_end, y_begin, y_end, z_begin, z_end;
+		if (sscanf(tile_key.c_str(), "%zu-%zu_%zu-%zu_%zu-%zu", &x_begin, &x_end, &y_begin, &y_end, &z_begin, &z_end) != 6)
 		{
 			res.code = crow::status::BAD_REQUEST;
 			res.end("400 Bad Request -- Invalid range string\n");
@@ -2401,13 +2404,13 @@ int main(int argc, char *argv[])
 				out_of_range |= y_end > std::get<1>(image_size);
 				out_of_range |= z_end > std::get<2>(image_size);
 			}
-			// Each axis must run forward: a reversed box (begin after end)
-			// would wrap chunk_sizes to a huge size, and an empty one (begin
-			// equal to end) reads nothing, so both are refused like a box
-			// past the image.
-			out_of_range |= x_begin >= x_end;
-			out_of_range |= y_begin >= y_end;
-			out_of_range |= z_begin >= z_end;
+			// A reversed box (begin after end) would wrap chunk_sizes to a
+			// huge size, so it is refused like a box past the image, as
+			// raw_access does. An empty box (begin equal to end) still
+			// answers an empty 200: viewers send them.
+			out_of_range |= x_begin > x_end;
+			out_of_range |= y_begin > y_end;
+			out_of_range |= z_begin > z_end;
 
 			if (out_of_range)
 			{
@@ -2587,8 +2590,8 @@ int main(int argc, char *argv[])
 		{
 			// The box read. The limit is per channel, so +channel=N does not
 			// change it, and a Zarr or descriptor dataset (which reads every
-			// channel even then) is held to the same box. A reversed box wraps
-			// to a huge size and counts as too large.
+			// channel even then) is held to the same box. A reversed box was
+			// refused above, so these sizes do not wrap.
 			const size_t read_x = x_end_project - x_begin_project;
 			const size_t read_y = y_end_project - y_begin_project;
 			const size_t read_z = z_end_project - z_begin_project;
