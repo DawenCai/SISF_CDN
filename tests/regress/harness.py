@@ -262,7 +262,8 @@ def read_corpus(info_by_ds):
                 x0, y0, z0 = (int(rng.integers(0, d)) for d in (X, Y, Z))
                 x1, y1, z1 = (int(rng.integers(a + 1, d + 1)) for a, d in ((x0, X), (y0, Y), (z0, Z)))
                 add(f"rand{i}", box(x0, x1, y0, y1, z0, z1))
-            # Out-of-range and malformed requests: both servers must answer alike.
+            # Out-of-range and malformed requests: both servers must answer
+            # alike, except the reversed box, which the fork refuses (listed).
             add("beyond-x", box(0, X + 50, 0, min(Y, 8), 0, 1))
             add("beyond-z", box(0, min(X, 8), 0, min(Y, 8), max(0, Z - 1), Z + 5))
             add("empty", box(5, 5, 0, 8, 0, 1))
@@ -746,13 +747,19 @@ def sc_raw_access_outside(server, results, sid):
 
 
 def sc_box_order(server, results, sid):
-    """Image reads whose box does not run forward on some axis, with no read
-    limit set: begin after end on x, y or z, the same on x with a gamma
-    filter, begin equal to end, and an end past the image. Production fails
-    a reversed box with 500, dies on one with a filter (the read buffer is
-    never allocated and the filter writes into it), and answers an empty box
-    with an empty 200. The same forward box, with and without the filter,
-    is the control and answers alike on both."""
+    """Image reads whose box does not run forward on some axis, or has a
+    coordinate that does not fit in 32 bits, with no read limit set.
+    Production fails a reversed box with 500, dies on one with a filter (the
+    read buffer is never allocated and the filter writes into it), and
+    answers an empty box with an empty 200. It keeps only the low 32 bits of
+    each coordinate, so on level 2 of vol1c (50 x 45 x 18) z 19-4294967314,
+    the shape viewers have been seen sending at coarse levels, becomes the
+    reversed 19-18, and z 0-4294967297 becomes 0-1 and x 4294967298-8 becomes
+    2-8, which it serves. The fork refuses all three with 400, like a
+    reversed box or one past the image. The forward box and the empty boxes
+    (x, y and z, with and without a filter) are the controls and answer alike
+    on both."""
+    big = 2 ** 32
     for name, path in (
             ("forward box", "/vol1c/1/" + box(0, 8, 0, 8, 0, 1)),
             ("forward box, gamma", "/vol1c+gamma=1/1/" + box(0, 8, 0, 8, 0, 1)),
@@ -761,7 +768,15 @@ def sc_box_order(server, results, sid):
             ("reversed z", "/vol1c/1/" + box(0, 8, 0, 8, 1, 0)),
             ("reversed x, gamma", "/vol1c+gamma=1/1/" + box(8, 2, 0, 8, 0, 1)),
             ("empty x", "/vol1c/1/" + box(2, 2, 0, 8, 0, 1)),
-            ("x past the image", "/vol1c/1/" + box(0, 101, 0, 8, 0, 1))):
+            ("empty x, gamma", "/vol1c+gamma=1/1/" + box(2, 2, 0, 8, 0, 1)),
+            ("empty y", "/vol1c/1/" + box(0, 8, 2, 2, 0, 1)),
+            ("x past the image", "/vol1c/1/" + box(0, 101, 0, 8, 0, 1)),
+            ("level 2, z 19 to 2^32 + 18", "/vol1c/2/" + box(0, 8, 0, 8, 19, big + 18)),
+            ("level 2, z 19 to 2^32 + 18, gaussian", "/vol1c+gaussian=1/2/" + box(0, 8, 0, 8, 19, big + 18)),
+            ("level 2, empty z at its last plane's end, gaussian", "/vol1c+gaussian=1/2/" + box(0, 8, 0, 8, 18, 18)),
+            ("level 2, z 0 to 2^32 + 1", "/vol1c/2/" + box(0, 8, 0, 8, 0, big + 1)),
+            ("x 2^32 to 2^32 + 8", "/vol1c/1/" + box(big, big + 8, 0, 8, 0, 1)),
+            ("x 2^32 + 2 to 8", "/vol1c/1/" + box(big + 2, 8, 0, 8, 0, 1))):
         results[f"{sid}: {name}"] = digest(*server.request("GET", path))
 
 
