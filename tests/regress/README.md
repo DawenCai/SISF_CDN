@@ -117,6 +117,16 @@ baseline first. A missing image fails the run instead of being fetched.
     files are refused, and every file of both datasets is as it was before
     them. A build that lets the level through the route check but writes
     level 1 answers 200 and puts the level-2 voxels into level 1.
+  - s21: image reads whose box runs backwards on x, y or z (on x also with
+    a filter), and boxes with a coordinate that does not fit in 32 bits:
+    z 19 to 2^32 + 18 on level 2 (18 deep), with and without a gaussian
+    filter, z 0 to 2^32 + 1, x 2^32 to 2^32 + 8, and x 2^32 + 2 to 8.
+    Production fails a reversed box with 500 and dies on one with a filter;
+    it keeps only the low 32 bits of each coordinate, so the large ones
+    become a reversed box or a smaller one that it serves. The fork answers
+    each of these 400 'Invalid data range'. Controls that answer alike on
+    both: a forward box, empty boxes on x, y and z (with and without a
+    filter) and a box past the image.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
