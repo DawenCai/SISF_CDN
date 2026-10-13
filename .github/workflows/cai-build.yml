@@ -5,10 +5,11 @@ name: cai-build-and-regress
 # tests/regress, once as the release build and once as the ASan/UBSan build.
 # Nothing is published unless a run is started by hand with publish=true, and
 # only the release build is.
+#
+# It runs on pull requests and by hand, not on pushes as well: one run per
+# change instead of two, each about an hour of runner time.
 
 on:
-  push:
-    branches: [ "dev/**", "cai/**" ]
   pull_request:
   workflow_dispatch:
     inputs:
