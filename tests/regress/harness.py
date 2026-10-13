@@ -745,6 +745,26 @@ def sc_raw_access_outside(server, results, sid):
     results[f"{sid}: read"] = digest(*server.request("GET", "/vol1c/raw_access/0,0,0,0/1/" + box(0, 100, 0, 10, 0, 1)))
 
 
+def sc_box_order(server, results, sid):
+    """Image reads whose box does not run forward on some axis, with no read
+    limit set: begin after end on x, y or z, the same on x with a gamma
+    filter, begin equal to end, and an end past the image. Production fails
+    a reversed box with 500, dies on one with a filter (the read buffer is
+    never allocated and the filter writes into it), and answers an empty box
+    with an empty 200. The same forward box, with and without the filter,
+    is the control and answers alike on both."""
+    for name, path in (
+            ("forward box", "/vol1c/1/" + box(0, 8, 0, 8, 0, 1)),
+            ("forward box, gamma", "/vol1c+gamma=1/1/" + box(0, 8, 0, 8, 0, 1)),
+            ("reversed x", "/vol1c/1/" + box(8, 2, 0, 8, 0, 1)),
+            ("reversed y", "/vol1c/1/" + box(0, 8, 8, 2, 0, 1)),
+            ("reversed z", "/vol1c/1/" + box(0, 8, 0, 8, 1, 0)),
+            ("reversed x, gamma", "/vol1c+gamma=1/1/" + box(8, 2, 0, 8, 0, 1)),
+            ("empty x", "/vol1c/1/" + box(2, 2, 0, 8, 0, 1)),
+            ("x past the image", "/vol1c/1/" + box(0, 101, 0, 8, 0, 1))):
+        results[f"{sid}: {name}"] = digest(*server.request("GET", path))
+
+
 def _encoded_read(server, results, key, path, accept_encoding):
     """Two results for a GET sent with accept_encoding: key, the body after
     decoding it (it must equal production's, which never compresses), and
@@ -1414,6 +1434,7 @@ SCENARIOS = [
     ("s15 files replaced during a read", sc_replaced_during_read),
     ("s19 concurrent PATCHes into one mchunk", sc_concurrent_patch),
     ("s20 writes to coarser levels", sc_pyramid_writes),
+    ("s21 box order", sc_box_order),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
