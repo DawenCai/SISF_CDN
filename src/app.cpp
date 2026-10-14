@@ -937,9 +937,12 @@ int main(int argc, char *argv[])
 			return;
 		}
 
-		unsigned int x_begin, x_end, y_begin, y_end, z_begin, z_end;
-		// <xBegin>-<xEnd>_<yBegin>-<yEnd>_<zBegin>-<zEnd>
-		if (sscanf(tile_key.c_str(), "%u-%u_%u-%u_%u-%u", &x_begin, &x_end, &y_begin, &y_end, &z_begin, &z_end) != 6)
+		// <xBegin>-<xEnd>_<yBegin>-<yEnd>_<zBegin>-<zEnd>. Read as size_t, as
+		// on the image route: %u kept only the low 32 bits, so x
+		// 4294967304-4294967312 was written at x 8-16. A coordinate that large
+		// is past the image and refused below.
+		size_t x_begin, x_end, y_begin, y_end, z_begin, z_end;
+		if (sscanf(tile_key.c_str(), "%zu-%zu_%zu-%zu_%zu-%zu", &x_begin, &x_end, &y_begin, &y_end, &z_begin, &z_end) != 6)
 		{
 			res.code = crow::status::BAD_REQUEST;
 			res.end("400 Bad Request -- Invalid range string\n");
@@ -983,6 +986,13 @@ int main(int argc, char *argv[])
 				out_of_range |= y_end > std::get<1>(image_size);
 				out_of_range |= z_end > std::get<2>(image_size);
 			}
+			// A reversed box is refused, as on the image route: its sizes
+			// wrap, and the wrapped sizes can multiply back to a small size
+			// that passes the body size check. An empty box with no axis
+			// reversed still writes nothing and answers "done.".
+			out_of_range |= x_begin > x_end;
+			out_of_range |= y_begin > y_end;
+			out_of_range |= z_begin > z_end;
 
 			if (out_of_range)
 			{
@@ -1969,9 +1979,11 @@ int main(int argc, char *argv[])
 			return;
 		}
 
-		unsigned int x_begin, x_end, y_begin, y_end, z_begin, z_end;
-		// <xBegin>-<xEnd>_<yBegin>-<yEnd>_<zBegin>-<zEnd>
-		if (sscanf(tile_key.c_str(), "%u-%u_%u-%u_%u-%u", &x_begin, &x_end, &y_begin, &y_end, &z_begin, &z_end) != 6)
+		// <xBegin>-<xEnd>_<yBegin>-<yEnd>_<zBegin>-<zEnd>. Read as size_t, as
+		// on the image route, so a coordinate past 32 bits is refused below
+		// instead of being cut to its low 32 bits.
+		size_t x_begin, x_end, y_begin, y_end, z_begin, z_end;
+		if (sscanf(tile_key.c_str(), "%zu-%zu_%zu-%zu_%zu-%zu", &x_begin, &x_end, &y_begin, &y_end, &z_begin, &z_end) != 6)
 		{
 			res.code = crow::status::BAD_REQUEST;
 			res.end("Bad Request -- invalid range");

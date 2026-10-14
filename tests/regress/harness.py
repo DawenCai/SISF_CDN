@@ -1465,6 +1465,55 @@ def sc_pyramid_writes(server, results, sid):
                                                    + "".join(f"; {x}" for x in changed[:6])}
 
 
+def sc_wide_coordinates(server, results, sid):
+    """Boxes with a coordinate past 32 bits, or a negative one, on the write
+    route and on raw_access, which read each coordinate into 32 bits on
+    production. A writable layer (64 x 64 x 32, one mchunk) takes a forward
+    PATCH as the control. Then PATCHes of x 2^32 + 8 to 2^32 + 16, x 2^32 + 8
+    to 16 (only the begin past 32 bits), x 8 to 2^32 + 16 (only the end) and x
+    -(2^32 - 8) to 16, all of which production writes at x 8-16; boxes
+    reversed on x and y (2-byte body), on y only and on z only; and empty
+    boxes on y and on z, which write nothing on both (controls). After them
+    the layer's files must be as they were and x 8-16 must still read as
+    zeros. raw_access on vol1c's mchunk (0,0,0) gets z 0 to 2^32 + 1, x 2^32 +
+    2 to 8 and x -(2^32 - 6) to 8, which production serves as z 0-1, x 2-8 and
+    x 6-8, beside a forward and an empty box as controls."""
+    ds, big, tok = "sc_w32", 2 ** 32, f"+token={fixtures.TOKEN}"
+    root = os.path.join(server.data_dir, ds)
+    fixtures.segmentation(root, (64, 64, 32), (64, 64, 32), RES)
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            _wait_visible(server, os.path.relpath(os.path.join(dirpath, f), server.data_dir))
+    w = f"/{ds}{tok}/write/1/"
+    results[f"{sid}: PATCH x 0-8 (control)"] = digest(*server.request(
+        "PATCH", w + box(0, 8, 0, 8, 0, 1), np.full(64, 5, dtype=np.uint16).tobytes()))
+    find = f"cd /data && find {ds} -type f -exec sha256sum {{}} + | sort -k 2"
+    files = lambda: subprocess.run(["docker", "exec", server.name, "sh", "-c", find],
+                                   capture_output=True, text=True).stdout.splitlines()
+    before = files()
+    seven = np.full(64, 7, dtype=np.uint16).tobytes()
+    for tag, b, body in (("x 2^32 + 8 to 2^32 + 16", box(big + 8, big + 16, 0, 8, 0, 1), seven),
+                         ("x 2^32 + 8 to 16", box(big + 8, 16, 0, 8, 0, 1), seven),
+                         ("x 8 to 2^32 + 16", box(8, big + 16, 0, 8, 0, 1), seven),
+                         ("x -(2^32 - 8) to 16", box(-(big - 8), 16, 0, 8, 0, 1), seven),
+                         ("reversed on x and y", box(1, 0, 1, 0, 0, 1), np.full(1, 7, dtype=np.uint16).tobytes()),
+                         ("reversed on y", box(0, 8, 8, 0, 0, 1), seven),
+                         ("reversed on z", box(0, 8, 0, 8, 1, 0), seven),
+                         ("empty y (control)", box(0, 8, 2, 2, 0, 1), b""),
+                         ("empty z (control)", box(0, 8, 0, 8, 3, 3), b"")):
+        results[f"{sid}: PATCH {tag}"] = digest(*server.request("PATCH", w + b, body))
+    changed = sorted(set(before) ^ set(files()))
+    results[f"{sid}: files after the PATCHes"] = {"status": "same" if not changed else "changed", "len": None,
+                                                  "sha256": None, "text": f"{len(before)} files before"
+                                                  + "".join(f"; {x}" for x in changed[:6])}
+    results[f"{sid}: read x 0-16 back"] = digest(*server.request("GET", f"/{ds}{tok}/1/" + box(0, 16, 0, 8, 0, 1)))
+    r = "/vol1c/raw_access/0,0,0,0/1/"
+    for tag, b in (("forward (control)", box(0, 8, 0, 8, 0, 1)), ("empty (control)", box(2, 2, 0, 8, 0, 1)),
+                   ("z 0 to 2^32 + 1", box(0, 8, 0, 8, 0, big + 1)), ("x 2^32 + 2 to 8", box(big + 2, 8, 0, 8, 0, 1)),
+                   ("x -(2^32 - 6) to 8", box(-(big - 6), 8, 0, 8, 0, 1))):
+        results[f"{sid}: raw_access {tag}"] = digest(*server.request("GET", r + b))
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
 # s7 runs last: production dies in it, and nothing should depend on a server
@@ -1488,6 +1537,7 @@ SCENARIOS = [
     ("s19 concurrent PATCHes into one mchunk", sc_concurrent_patch),
     ("s20 writes to coarser levels", sc_pyramid_writes),
     ("s21 box order", sc_box_order),
+    ("s22 wide coordinates on writes and raw_access", sc_wide_coordinates),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s23 raw_access unfilled part", sc_raw_access_unfilled),
     ("s7 tile regrown in place", sc_regrown_tile),
@@ -1495,7 +1545,9 @@ SCENARIOS = [
 # sc_cpatch (s19) is not here: where its frames land in the .data depends on
 # which of its concurrent writes goes first, so s19 checks those files itself.
 # Nor are s20's: their coarse files differ wherever a server refuses coarse
-# writes, so s20 compares its level-1 files and checks the rest itself.
+# writes, so s20 compares its level-1 files and checks the rest itself. Nor
+# is s22's: production writes the PATCHes the fork refuses, so s22 checks its
+# files itself.
 SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short", "sc_strict", "sc_regrow", "sc_regrow_w",
                      "sc_cold", "sc_video", "sc_ka_image", "sc_ka_labels", "sc_rename"]
 

@@ -136,6 +136,18 @@ baseline first. A missing image fails the run instead of being fetched.
     each of these 400 'Invalid data range'. Controls that answer alike on
     both: a forward box, empty boxes on x, y and z (with and without a
     filter) and a box past the image.
+  - s22: coordinates past 32 bits, or negative, on the write route and on
+    raw_access. On a writable layer of its own, after a forward PATCH (the
+    control): PATCHes of x 2^32 + 8 to 2^32 + 16, x 2^32 + 8 to 16, x 8 to
+    2^32 + 16 and x -(2^32 - 8) to 16, which production writes at x 8-16;
+    boxes reversed on x and y (2-byte body), on y and on z; and empty boxes
+    on y and z, which write nothing on both. The fork refuses every one but
+    the empty boxes with 400, and the layer's files and its x 8-16 must be as
+    they were. raw_access, on vol1c's mchunk (0,0,0), gets z 0 to 2^32 + 1,
+    x 2^32 + 2 to 8 and x -(2^32 - 6) to 8 (production serves z 0-1, x 2-8
+    and x 6-8; the fork answers 400), beside a forward and an empty box that
+    answer alike on both. The layer is not in the final byte comparison:
+    production writes it.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
