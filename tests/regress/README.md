@@ -42,6 +42,15 @@ baseline first. A missing image fails the run instead of being fetched.
     holds readers for it, then read and written in the one chunk whose
     extent grew; it runs last because production dies in it;
   - s8: a `raw_access` read wider than the mchunk's stored tile;
+  - s23: `raw_access` on the 3-channel vol3c, once per channel key. The
+    answer is sized for every channel but holds only the key's channel, in
+    its first block; the rest must be zero. Production allocates it with
+    malloc and leaves the rest as it was. A second server is started with
+    `MALLOC_PERTURB_=165` (glibc then fills every malloc, not calloc), so a
+    build that still uses malloc fails every time, and with the ASan
+    allocator's own fill options for the sanitizer build. The record holds
+    counts only: channels with a wrong length, a nonzero unfilled part, or a
+    first block that is not the image route's channel;
   - s9: s6's sequence with the `.meta` unreadable instead, on an mchunk the
     server has never opened, so no reader can be built for it during the
     read;

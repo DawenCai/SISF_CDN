@@ -746,6 +746,44 @@ def sc_raw_access_outside(server, results, sid):
     results[f"{sid}: read"] = digest(*server.request("GET", "/vol1c/raw_access/0,0,0,0/1/" + box(0, 100, 0, 10, 0, 1)))
 
 
+def sc_raw_access_unfilled(server, results, sid):
+    """raw_access on the 3-channel vol3c (the whole 70 x 60 x 20 mchunk, once
+    per channel key). The answer is sized for every channel but holds only
+    the channel in the key, in its first block; the rest of it must be zero.
+    Production allocates it with malloc and leaves it as it was, which is
+    whatever an earlier request freed. To make that visible every time, the
+    server is started with MALLOC_PERTURB_=165, which glibc applies to every
+    malloc but not to calloc (the ASan build has its own allocator and
+    ignores it; ASAN_OPTIONS asks it to fill the first 64 MiB the same way).
+    Per channel: the answer is exactly 3 blocks long, the first block is that
+    channel of the image route's all-channel answer, and everything after the
+    first block is zero. The record holds counts only, never bytes."""
+    env = {"MALLOC_PERTURB_": "165",
+           "ASAN_OPTIONS": "malloc_fill_byte=165:max_malloc_fill_size=67108864"}
+    perturbed = Server(f"{server.role}-perturb", server.image, server.platform, server.data_dir, env)
+    try:
+        perturbed.start()
+        st, whole = perturbed.request("GET", "/vol3c/1/" + box(0, 70, 0, 60, 0, 20))
+        block = 70 * 60 * 20 * 2
+        channels = len(whole) // block if st == 200 else 0
+        bad_length = dirty_tail = wrong_head = 0
+        for c in range(channels):
+            st, body = perturbed.request("GET", f"/vol3c/raw_access/{c},0,0,0/1/" + box(0, 70, 0, 60, 0, 20))
+            if st != 200 or len(body) != block * channels:
+                bad_length += 1
+                continue
+            dirty_tail += any(body[block:])
+            wrong_head += body[:block] != whole[c * block:(c + 1) * block]
+        ok = channels == 3 and not (bad_length or dirty_tail or wrong_head)
+        results[f"{sid}: vol3c, malloc filled with 165"] = {
+            "status": "pass" if ok else "fail", "len": None, "sha256": None,
+            "text": f"{channels} channels; {bad_length} with a wrong status or length, "
+                    f"{dirty_tail} with a nonzero unfilled part, {wrong_head} with a first block "
+                    f"that is not the image route's channel"}
+    finally:
+        perturbed.remove()
+
+
 def sc_box_order(server, results, sid):
     """Image reads whose box does not run forward on some axis, or has a
     coordinate that does not fit in 32 bits, with no read limit set.
@@ -1501,6 +1539,7 @@ SCENARIOS = [
     ("s21 box order", sc_box_order),
     ("s22 wide coordinates on writes and raw_access", sc_wide_coordinates),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
+    ("s23 raw_access unfilled part", sc_raw_access_unfilled),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
 # sc_cpatch (s19) is not here: where its frames land in the .data depends on
