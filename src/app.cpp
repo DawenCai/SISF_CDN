@@ -2039,7 +2039,10 @@ int main(int argc, char *argv[])
 			return;
 		}
 
-		uint16_t * out_buffer = (uint16_t*) malloc(out_buffer_size);
+		// Sized for every channel but filled with the one in the chunk key, so
+		// it must start zeroed: with malloc the rest of the answer was memory
+		// left over from earlier requests.
+		uint16_t * out_buffer = (uint16_t*) calloc(out_buffer_size, 1);
 		if (out_buffer == NULL)
 		{
 			res.code = crow::status::INTERNAL_SERVER_ERROR;
