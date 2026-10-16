@@ -148,6 +148,30 @@ baseline first. A missing image fails the run instead of being fetched.
     and x 6-8; the fork answers 400), beside a forward and an empty box that
     answer alike on both. The layer is not in the final byte comparison:
     production writes it.
+  - s24: the levels of an axis held in ONE mchunk (the portal writes every
+    image up to 4096 x 4096 x 512 that way). The writer halves the whole
+    mchunk level by level (`d // 2`), so level S holds floor(size / S)
+    planes there; the CDN used to declare one fewer wherever the size is not
+    a multiple of S, which hid the last stored plane and, with the exact
+    voxel size, put the viewer's clip bound (size / S) more than a plane past
+    the declared size, so its prefetch asked for chunks that start past the
+    end and whose size wraps to a URL end past 2^32 (BUG-213). Five
+    datasets are built while the server runs: three images with every axis in
+    one mchunk (70 x 60 x 13, 64 x 64 x 15, 45 x 50 x 17, levels 1, 2, 4,
+    8), one with z in two mchunks of 37 (its sizes must stay as they were),
+    and a 2 x 2 tiled one with z in one mchunk and a crop window; plus a
+    writable layer (70 x 60 x 13, skeleton levels). Records: each dataset's
+    level sizes and voxel sizes (level 1 is the same on both servers); every
+    one-mchunk axis size against the shape and crop window in the `.meta`
+    header on disk (none may be past what the file holds, and the untiled
+    ones must equal it); the last stored plane of each axis at each level
+    read through the image route and compared with the fixture; a max
+    projection that runs into the last plane; the voxel sizes
+    `raw_access/.../info` lists; the chunk
+    requests a viewer would make past the declared sizes, worked out from
+    `/info` (`viewer_overreach`, the viewer's prefetch arithmetic): none may
+    wrap, and the empty boxes must answer 200 with no body; and PATCHes of
+    the last plane of each axis of levels 2, 4 and 8 of the layer, read back.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
