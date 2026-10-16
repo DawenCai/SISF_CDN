@@ -2044,6 +2044,21 @@ public:
         dilation_y = std::ceil(dilation_y);
         dilation_z = std::ceil(dilation_z);
 
+        // An axis held in ONE mchunk has no mchunk boundary at which a level
+        // would leave out the last (mchunk mod scale) voxels: the whole
+        // mchunk is halved level by level (d // 2 each time, as the portal's
+        // writer does), so it stores floor(size / scale) voxels and all of
+        // them are declared. Taking the remainder off again hid the last
+        // stored voxel (BUG-213): the viewer's clip bound, size / scale, then
+        // lay more than one voxel past the declared size, and it asked for
+        // chunks there. Axes split over several mchunks keep the subtraction.
+        if (this->mcountx == 1)
+            dilation_x = 0;
+        if (this->mcounty == 1)
+            dilation_y = 0;
+        if (this->mcountz == 1)
+            dilation_z = 0;
+
         auto sub_clamp = [](size_t a, double b) -> size_t {
             return (size_t)std::max<int64_t>((int64_t)a - (int64_t)b, 1);
         };
