@@ -148,8 +148,9 @@ baseline first. A missing image fails the run instead of being fetched.
     and x 6-8; the fork answers 400), beside a forward and an empty box that
     answer alike on both. The layer is not in the final byte comparison:
     production writes it.
-  - s24: the levels of an axis held in ONE mchunk (the portal writes every
-    image up to 4096 x 4096 x 512 that way). The writer halves the whole
+  - s24: the levels of an axis held in ONE mchunk (the portal's writer makes
+    x and y one mchunk up to 4096, and z one mchunk while z <= 512 and
+    x * y * z <= 2^31). The writer halves the whole
     mchunk level by level (`d // 2`), so level S holds floor(size / S)
     planes there; the CDN used to declare one fewer wherever the size is not
     a multiple of S, which hid the last stored plane and, with the exact

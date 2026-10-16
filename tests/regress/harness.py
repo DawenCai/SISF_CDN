@@ -1580,9 +1580,10 @@ def _level_text(info):
 
 
 def sc_one_mchunk_levels(server, results, sid):
-    """Levels of an axis held in ONE mchunk (the portal writes every image up
-    to 4096 x 4096 x 512 so). The writer halves the whole mchunk level by level
-    (d // 2), so level S holds floor(size / S) planes there; the CDN used to
+    """Levels of an axis held in ONE mchunk (the portal's writer makes x and y
+    one mchunk up to 4096, and z one mchunk while z <= 512 and x * y * z <=
+    2^31). The writer halves the whole mchunk level by level (d // 2), so
+    level S holds floor(size / S) planes there; the CDN used to
     declare one fewer whenever size is not a multiple of S, which hides the last
     stored plane and, with the exact voxel size, puts the viewer's clip bound
     (size / S) more than a plane past the declared size, so that its prefetch
