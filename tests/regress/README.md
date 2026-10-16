@@ -159,7 +159,8 @@ baseline first. A missing image fails the run instead of being fetched.
     end and whose size wraps to a URL end past 2^32 (BUG-213). Five
     datasets are built while the server runs: three images with every axis in
     one mchunk (70 x 60 x 13, 64 x 64 x 15, 45 x 50 x 17, levels 1, 2, 4,
-    8), one with z in two mchunks of 37 (its sizes must stay as they were),
+    8), one with every axis in two mchunks of 37 (70 x 70 x 70, levels 1, 2,
+    4; its sizes must stay as they were),
     and a 2 x 2 tiled one with z in one mchunk and a crop window; plus a
     writable layer (70 x 60 x 13, skeleton levels). Records: each dataset's
     level sizes and voxel sizes (level 1 is the same on both servers); every

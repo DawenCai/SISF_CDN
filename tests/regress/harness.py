@@ -1589,8 +1589,9 @@ def sc_one_mchunk_levels(server, results, sid):
     (size / S) more than a plane past the declared size, so that its prefetch
     asks for chunks that start past the end and whose size wraps (BUG-213).
     Datasets, each with levels 1, 2, 4 and 8 unless noted: three images with
-    every axis in one mchunk, one with z in two mchunks of 37 (levels 1, 2, 4;
-    its sizes are the same as before), one tiled with z in one mchunk and a
+    every axis in one mchunk, one with every axis in two mchunks of 37
+    (70 x 70 x 70, levels 1, 2, 4; its sizes are the same as before), one
+    tiled with z in one mchunk and a
     crop window, and a writable layer with skeleton levels. Records: each
     dataset's level sizes and voxel sizes; the sizes against the files' own
     headers; the last stored plane of every one-mchunk axis read back against
@@ -1607,7 +1608,7 @@ def sc_one_mchunk_levels(server, results, sid):
         chains[ds] = [vol[0]]
         for _ in range(3):
             chains[ds].append(fixtures.downsample2(chains[ds][-1]))
-    fixtures.untiled(os.path.join(root, S24_SPLIT), fixtures.pattern((1, 64, 64, 70), 27), (64, 64, 37), RES, 3)
+    fixtures.untiled(os.path.join(root, S24_SPLIT), fixtures.pattern((1, 70, 70, 70), 27), (37, 37, 37), RES, 3)
     keep = {}
     fixtures.tiled(os.path.join(root, S24_TILED), 1, (2, 2, 1), (64, 64, 41), (8, 8, 4), RES, 28, min_xy=16, keep=keep)
     wsize = (70, 60, 13)
