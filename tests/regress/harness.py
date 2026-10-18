@@ -1514,6 +1514,227 @@ def sc_wide_coordinates(server, results, sid):
         results[f"{sid}: raw_access {tag}"] = digest(*server.request("GET", r + b))
 
 
+TWO32 = 1 << 32
+
+
+def _f32(x):
+    return float(np.float32(x))
+
+
+def viewer_overreach(info):
+    """The chunk requests a viewer makes past each level's declared size, worked
+    out from /info alone: [(level key, box, kind)], kind 'empty' (begin equals
+    end), 'wrapped' (end past 2**32) or 'past'. The viewer asks for chunks up
+    to ceil(upperClipBound / c) - 1 along an axis (neuroglancer
+    src/sliceview/backend.ts:494-496 at 9775be67), upperClipBound being
+    float32(level-1 size / voxel size ratio) (src/datasource/precomputed/
+    frontend.ts:334-343), though only ceil(float32(size) / c) chunks hold data.
+    A chunk's size goes into a Uint32Array (src/sliceview/volume/backend.ts:
+    119-133), so one that starts past the end has a negative size that wraps,
+    and its URL ends at begin + 2**32 - overshoot (src/datasource/precomputed/
+    backend.ts:142-149). Each such chunk is paired with chunk 0 on the other
+    two axes."""
+    scales = info["scales"]
+    size0, res0 = scales[0]["size"], scales[0]["resolution"]
+    seen, out = set(), []
+    for sc in scales:
+        size, res = sc["size"], sc["resolution"]
+        clip = [_f32(size0[a] / (res[a] / res0[a])) for a in range(3)]
+        top = [_f32(size[a]) for a in range(3)]
+        for cs in sc["chunk_sizes"]:
+            for ax in range(3):
+                c = cs[ax]
+                for k in range(int(np.floor((top[ax] - 1) / c + 1)), int(np.ceil(clip[ax] / c))):
+                    lo, hi = [0, 0, 0], [0, 0, 0]
+                    for a in range(3):
+                        lo[a] = k * c if a == ax else 0
+                        hi[a] = lo[a] + int((min(top[a], lo[a] + cs[a]) - lo[a]) % TWO32)
+                    kind = "wrapped" if hi[ax] >= TWO32 else ("empty" if hi[ax] == lo[ax] else "past")
+                    key = (sc["key"], box(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+                    if key not in seen:
+                        seen.add(key)
+                        out.append((*key, kind))
+    return out
+
+
+def _stored(root, ds, scale):
+    """From the .meta header on disk, not from the server: the shape of mchunk
+    (0,0,0) of channel 0 at one level, the length of its crop window on each
+    axis (the part of it that is image) and where the window starts."""
+    with open(os.path.join(root, ds, "meta", f"chunk_0_0_0.0.{scale}X.meta"), "rb") as f:
+        v = struct.unpack(fixtures.SHARD_HEADER_LAYOUT, f.read(86))
+    return (tuple(v[7:10]), tuple(v[11 + 2 * a] - v[10 + 2 * a] for a in range(3)),
+            tuple(v[10 + 2 * a] for a in range(3)))
+
+
+S24_UNTILED = {"sc_one_a": ((70, 60, 13), 24), "sc_one_b": ((64, 64, 15), 25), "sc_one_c": ((45, 50, 17), 26)}
+S24_SPLIT, S24_TILED, S24_WRITE = "sc_one_split", "sc_one_tiled", "sc_one_seg"
+S24_STEP_Z = 37  # the tiled dataset's tile step in z: 41 deep with 4 overlapping
+
+
+def _level_text(info):
+    if info is None:
+        return None
+    return "; ".join(f"{s['key']}: {'x'.join(map(str, s['size']))} at {'x'.join(map(str, s['resolution']))} nm"
+                     for s in info["scales"])
+
+
+def sc_one_mchunk_levels(server, results, sid):
+    """Levels of an axis held in ONE mchunk (the portal's writer makes x and y
+    one mchunk up to 4096, and z one mchunk while z <= 512 and x * y * z <=
+    2^31). The writer halves the whole mchunk level by level (d // 2), so
+    level S holds floor(size / S) planes there; the CDN used to
+    declare one fewer whenever size is not a multiple of S, which hides the last
+    stored plane and, with the exact voxel size, puts the viewer's clip bound
+    (size / S) more than a plane past the declared size, so that its prefetch
+    asks for chunks that start past the end and whose size wraps (BUG-213).
+    Datasets, each with levels 1, 2, 4 and 8 unless noted: three images with
+    every axis in one mchunk, one with every axis in two mchunks of 37
+    (70 x 70 x 70, levels 1, 2, 4; its sizes are the same as before), one
+    tiled with z in one mchunk and a
+    crop window, and a writable layer with skeleton levels. Records: each
+    dataset's level sizes and voxel sizes; the sizes against the files' own
+    headers; the last stored plane of every one-mchunk axis read back against
+    the fixture; a max projection that runs into the last plane; the voxel
+    sizes raw_access/.../info lists; the chunk requests a viewer would make
+    past the declared sizes (none may wrap, the empty ones must answer 200
+    with no body); and PATCHes of the last plane of every coarse level of the
+    layer, read back."""
+    root = server.data_dir
+    chains = {}
+    for ds, (shape, seed) in S24_UNTILED.items():
+        vol = fixtures.pattern((1, *shape), seed)
+        fixtures.untiled(os.path.join(root, ds), vol, shape, RES, 4)
+        chains[ds] = [vol[0]]
+        for _ in range(3):
+            chains[ds].append(fixtures.downsample2(chains[ds][-1]))
+    fixtures.untiled(os.path.join(root, S24_SPLIT), fixtures.pattern((1, 70, 70, 70), 27), (37, 37, 37), RES, 3)
+    keep = {}
+    fixtures.tiled(os.path.join(root, S24_TILED), 1, (2, 2, 1), (64, 64, 41), (8, 8, 4), RES, 28, min_xy=16, keep=keep)
+    wsize = (70, 60, 13)
+    wroot = os.path.join(root, S24_WRITE)
+    fixtures.segmentation(wroot, wsize, wsize, RES)
+    for s in (2, 4, 8):
+        fixtures.write_skeleton(f"{wroot}/data/chunk_0_0_0.0.{s}X.data", f"{wroot}/meta/chunk_0_0_0.0.{s}X.meta",
+                                tuple(max(1, d // s) for d in wsize), (32, 32, 32))
+    images = [*S24_UNTILED, S24_SPLIT, S24_TILED]
+    for ds in [*images, S24_WRITE]:  # every level is there before the server first scans it
+        for dirpath, _, files in os.walk(os.path.join(root, ds)):
+            for f in files:
+                _wait_visible(server, os.path.relpath(os.path.join(dirpath, f), root))
+
+    info = {}
+    for ds in images:
+        st, body = server.request("GET", f"/{ds}/info")
+        info[ds] = json.loads(body) if st == 200 else None
+        results[f"{sid}: {ds} levels"] = {"status": st, "len": None, "sha256": None,
+                                          "text": _level_text(info[ds]) if info[ds] else str(body)[:300]}
+    level1 = [f"{ds} " + (_level_text({"scales": info[ds]["scales"][:1]}) if info[ds] else "?") for ds in images]
+    results[f"{sid}: level 1 of every dataset"] = {"status": "info", "len": None, "sha256": None,
+                                                   "text": "; ".join(level1)}
+
+    # The declared sizes against what the files hold.
+    one_axes = {ds: (0, 1, 2) for ds in S24_UNTILED}
+    one_axes[S24_TILED] = (2,)
+    n_u = n_t = short = over_u = over_t = 0
+    for ds, axes in one_axes.items():
+        for sc in (info[ds] or {"scales": []})["scales"]:
+            valid = _stored(root, ds, int(sc["key"]))[1]
+            for ax in axes:
+                if ds == S24_TILED:
+                    n_t += 1
+                    over_t += sc["size"][ax] > valid[ax]
+                else:
+                    n_u += 1
+                    short += sc["size"][ax] < valid[ax]
+                    over_u += sc["size"][ax] > valid[ax]
+    results[f"{sid}: declared sizes against the files"] = {
+        "status": "pass" if n_u and not (short or over_u or over_t) else "fail", "len": None, "sha256": None,
+        "text": f"{n_u} sizes of untiled one-mchunk axes: {short} declare fewer planes than the files hold, "
+                f"{over_u} more; {n_t} sizes of the tiled one-mchunk axis: {over_t} declare more planes than "
+                f"its crop window holds"}
+
+    # The last plane the writer stored on each one-mchunk axis, read back.
+    n = bad = 0
+    for ds, chain in chains.items():
+        for sc in (info[ds] or {"scales": []})["scales"]:
+            s = int(sc["key"])
+            arr = chain[s.bit_length() - 1]
+            for ax in range(3):
+                lo, hi = [0, 0, 0], list(arr.shape)
+                lo[ax] = arr.shape[ax] - 1
+                st, got = server.request("GET", f"/{ds}/{s}/" + box(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+                want = arr[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]].transpose(2, 1, 0).tobytes()
+                n += 1
+                bad += not (st == 200 and got == want)
+    for sc in (info[S24_TILED] or {"scales": []})["scales"]:
+        s = int(sc["key"])
+        arr, crop = keep[(0, 0, 0, 0, s)]
+        mx, my, k = 56 // s, 56 // s, S24_STEP_Z // s - 1  # tile (0,0,0) is level-S voxels 0..56/S in x and y
+        st, got = server.request("GET", f"/{S24_TILED}/{s}/" + box(0, mx, 0, my, k, k + 1))
+        want = arr[crop[0]:crop[0] + mx, crop[2]:crop[2] + my, crop[4] + k:crop[4] + k + 1].transpose(2, 1, 0).tobytes()
+        n += 1
+        bad += not (st == 200 and got == want)
+    results[f"{sid}: last stored planes read back"] = {
+        "status": "pass" if n and not bad else "fail", "len": None, "sha256": None,
+        "text": f"{n} last planes read (every axis of the three untiled images at every level, z of the tiled "
+                f"one): {bad} refused or different from the fixture"}
+
+    # A max projection along z at level 2 of the 15-deep image: the box is plane 5 of 7, and 4 frames at level 2 are 2 planes, so the
+    # projection runs into plane 6, which the clamp to the declared size (6 before) used to cut off.
+    ds = "sc_one_b"
+    st, got = server.request("GET", f"/{ds}+project=4/2/" + box(0, 32, 0, 32, 5, 6))
+    want = chains[ds][1][:, :, 5:7].max(axis=2, keepdims=True).transpose(2, 1, 0).tobytes()
+    results[f"{sid}: projection into the last plane"] = {
+        "status": "pass" if st == 200 and got == want else "fail", "len": None, "sha256": None,
+        "text": f"sc_one_b level 2 (7 planes in z), z 5 to 6 projected over 2 frames, status {st}: "
+                + ("equals the maximum of planes 5 and 6" if got == want else "is not the maximum of planes 5 and 6")}
+    # raw_access/.../info lists the voxel sizes of the same levels.
+    st, body = server.request("GET", "/sc_one_c/raw_access/0,0,0,0/info")
+    results[f"{sid}: raw_access info voxel sizes"] = {
+        "status": st, "len": None, "sha256": None,
+        "text": "; ".join(f"{s_['key']}: {'x'.join(map(str, s_['resolution']))} nm" for s_ in json.loads(body)["scales"])
+        if st == 200 else str(body)[:300]}
+
+    # What a viewer would ask for past the declared sizes.
+    total = wrapped = empty = past = empty_ok = 0
+    for ds in images:
+        for lvl, b, kind in (viewer_overreach(info[ds]) if info[ds] else []):
+            st, body = server.request("GET", f"/{ds}/{lvl}/{b}")
+            total += 1
+            wrapped += kind == "wrapped"
+            past += kind == "past"
+            empty += kind == "empty"
+            empty_ok += kind == "empty" and st == 200 and not body
+    results[f"{sid}: viewer requests past the declared sizes"] = {
+        "status": "pass" if not (wrapped or past) and empty == empty_ok else "fail", "len": None, "sha256": None,
+        "text": f"{total} requests over {len(images)} datasets: {wrapped} wrapped past 2^32, {past} other, "
+                f"{empty} empty boxes of which {empty_ok} answered 200 with no body"}
+
+    # PATCHes of the last plane of every axis of every coarse level.
+    tok = f"+token={fixtures.TOKEN}"
+    sent = ok200 = differ = 0
+    for s in (2, 4, 8):
+        shape = tuple(max(1, d // s) for d in wsize)  # x, y, z
+        model = np.zeros(shape[::-1], np.uint16)  # z, y, x as reads return
+        for ax in range(3):
+            lo, hi = [0, 0, 0], list(shape)
+            lo[ax] = shape[ax] - 1
+            vol = np.random.default_rng([24, s, ax]).integers(1, 65536, size=tuple(hi[a] - lo[a] for a in (2, 1, 0)),
+                                                              dtype=np.uint16)
+            st, _ = server.request("PATCH", f"/{S24_WRITE}{tok}/write/{s}/" + box(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]),
+                                   vol.tobytes())
+            sent += 1
+            if st == 200:
+                ok200 += 1
+                model[lo[2]:hi[2], lo[1]:hi[1], lo[0]:hi[0]] = vol
+        st, got = server.request("GET", f"/{S24_WRITE}{tok}/{s}/" + box(0, shape[0], 0, shape[1], 0, shape[2]))
+        differ += not (st == 200 and got == model.tobytes())
+    results[f"{sid}: PATCH the last plane of each coarse level"] = {
+        "status": "pass" if ok200 == sent and not differ else "fail", "len": None, "sha256": None,
+        "text": f"{sent} PATCHes, {ok200} answered 200; {differ} of 3 levels differ from what was sent when read back"}
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
 # s7 runs last: production dies in it, and nothing should depend on a server
@@ -1540,6 +1761,7 @@ SCENARIOS = [
     ("s22 wide coordinates on writes and raw_access", sc_wide_coordinates),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s23 raw_access unfilled part", sc_raw_access_unfilled),
+    ("s24 one-mchunk levels", sc_one_mchunk_levels),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
 # sc_cpatch (s19) is not here: where its frames land in the .data depends on

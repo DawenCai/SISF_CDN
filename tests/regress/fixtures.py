@@ -105,16 +105,19 @@ def untiled(out, vol_cxyz, mchunk, res, levels):
                         create_shard(f"{out}/data/{name}.data", f"{out}/meta/{name}.meta", block, (32, 32, 32))
 
 
-def tiled(out, channels, grid, tile, overlap_px, res, seed):
+def tiled(out, channels, grid, tile, overlap_px, res, seed, min_xy=None, keep=None):
     """Portal tiled layout: each tile is one mchunk holding the whole tile, with
     a crop window that trims half the overlap on each side; metadata.bin records
-    the tile step as the mchunk size."""
+    the tile step as the mchunk size. min_xy is the smallest x and y a level may
+    have (default 32 for single-plane tiles, else 256, as the portal's writer);
+    keep, when given, receives {(channel, tx, ty, tz, scale): (array, crop)}."""
     step = tuple(t - o for t, o in zip(tile, overlap_px))
     write_metadata(out, channels, step, res, tuple(g * s for g, s in zip(grid, step)))
     margin = tuple(o // 2 for o in overlap_px)
     crop6 = (margin[0], overlap_px[0] - margin[0], margin[1], overlap_px[1] - margin[1],
              margin[2], overlap_px[2] - margin[2])
-    min_xy = 32 if tile[2] == 1 else 256
+    if min_xy is None:
+        min_xy = 32 if tile[2] == 1 else 256
     for c in range(channels):
         for tx in range(grid[0]):
             for ty in range(grid[1]):
@@ -134,6 +137,8 @@ def tiled(out, channels, grid, tile, overlap_px, res, seed):
                         chunk = tuple(min(d, 32) for d in cur.shape)
                         name = f"chunk_{tx}_{ty}_{tz}.{c}.{2 ** lvl}X"
                         create_shard(f"{out}/data/{name}.data", f"{out}/meta/{name}.meta", cur, chunk, crop)
+                        if keep is not None:
+                            keep[(c, tx, ty, tz, 2 ** lvl)] = (cur, crop)
 
 
 def downsample2_xy(a):
