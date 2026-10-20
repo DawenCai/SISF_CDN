@@ -29,6 +29,7 @@ Licensed under the terms specified in LICENSE.md
 #include <utility>
 #include <set>
 #include <chrono>
+#include <memory>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -202,7 +203,33 @@ void test_hold_write_lock()
     }
     std::cerr << "TEST HOOK: write lock released" << std::endl;
 }
+
+// Test-only, as above: while <data path>/.test_hold_skip_check exists, a write
+// that has chunks it may leave as stored waits here, after it read and
+// compared them and before it checks them again under the lock, holding no
+// lock. tests/regress/skip_unchanged.py lands another write, or replaces the
+// files, in between.
+void test_hold_before_skip_check()
+{
+    const std::string marker = DATA_PATH + ".test_hold_skip_check";
+    if (access(marker.c_str(), F_OK) != 0)
+    {
+        return;
+    }
+    std::cerr << "TEST HOOK: write held before its skip check while " << marker << " exists" << std::endl;
+    while (access(marker.c_str(), F_OK) == 0)
+    {
+        usleep(50 * 1000);
+    }
+    std::cerr << "TEST HOOK: skip check released" << std::endl;
+}
 #endif
+
+// With SKIP_UNCHANGED_CHUNKS=1 (app.cpp): chunks that writes covered whole, and
+// how many of those were left as stored because the write did not change
+// them. Shown on /performance only while the switch is on.
+std::atomic<uint64_t> skip_chunks_covered{0};
+std::atomic<uint64_t> skip_chunks_skipped{0};
 
 size_t global_cache_size = chunk_cache_lines_from_env();
 global_chunk_line *global_chunk_cache = (global_chunk_line *)calloc(global_cache_size, sizeof(global_chunk_line));
@@ -309,6 +336,7 @@ log_limiter log_limit_write_refused;
 log_limiter log_limit_write_failed;
 log_limiter log_limit_archive_meta;
 log_limiter log_limit_files_replaced;
+log_limiter log_limit_skipped;
 
 // https://stackoverflow.com/questions/8401777/simple-glob-in-c-on-unix-system
 std::vector<std::string> glob_tool(const std::string &pattern)
@@ -1036,8 +1064,14 @@ public:
     // with g's compression type, and the header is not checked for changes.
     // Without them, each read opens the file by name and a changed .meta is
     // reloaded first.
+    //
+    // entry, when given, receives the entry the chunk was read under. With
+    // bypass_cache the global cache is neither looked in nor added to, so the
+    // voxels are the ones that entry points at and the read never waits on
+    // the chunk cache lock.
     uint16_t *load_chunk(size_t id, size_t sizex, size_t sizey, size_t sizez, bool *failed = nullptr,
-                         const shard_geometry *g = nullptr, shard_files *files = nullptr)
+                         const shard_geometry *g = nullptr, shard_files *files = nullptr,
+                         metadata_entry *entry = nullptr, bool bypass_cache = false)
     {
         const size_t out_buffer_size = sizex * sizey * sizez * sizeof(uint16_t);
         uint16_t *out = (uint16_t *)calloc(out_buffer_size, 1);
@@ -1060,6 +1094,10 @@ public:
         bool entry_failed = false;
         metadata_entry *sel = files != nullptr ? read_meta_entry(*g, *files, id, &entry_failed)
                                                : load_meta_entry(id, &entry_failed);
+        if (entry != nullptr && sel != NULL)
+        {
+            *entry = *sel;
+        }
 
         if (sel == NULL || sel->size == 0)
         {
@@ -1072,6 +1110,7 @@ public:
 
         uint16_t *from_cache = 0;
 
+        if (!bypass_cache)
         {
             std::unique_lock<std::timed_mutex> lock(global_chunk_cache_mutex, cache_lock_timeout);
             if (lock.owns_lock())
@@ -1253,6 +1292,7 @@ public:
             // Copy result
             memcpy((void *)out, (void *)read_decomp_buffer, decomp_size);
 
+            if (!bypass_cache)
             {
                 std::unique_lock<std::timed_mutex> lock(global_chunk_cache_mutex, cache_lock_timeout);
                 // If data_gen moved, a write to this mchunk finished while this chunk
@@ -1405,6 +1445,54 @@ public:
 
         free(compressed_data);
         return entry_written && files_kept;
+    }
+
+    // True if chunk id's entry is still stamp, the entry its stored voxels
+    // were read under, so that leaving the chunk as stored is the same as
+    // writing those voxels again now. Checked holding the chunk cache lock,
+    // which every chunk write holds while it appends and enters its chunk,
+    // so no write lands between this check and the caller's decision. A
+    // write only ever appends to .data, so rewriting a chunk always moves its
+    // entry, and an equal entry means the same bytes. meta_fd and data_fd are
+    // the request's own descriptors, opened on the files of its snapshot (the
+    // caller checked them once); the rest of the snapshot (g, file_gen, the
+    // files at their paths) must still hold, as for a write (see
+    // replace_region step 3 and overwrite_chunk). False on any doubt, and the
+    // caller writes the chunk.
+    bool entry_still(size_t id, const metadata_entry &stamp, const shard_geometry &g, uint64_t expected_file_gen,
+                     const mchunk_file_ids &expected, int meta_fd, int data_fd)
+    {
+        if (meta_fd < 0 || data_fd < 0)
+        {
+            return false;
+        }
+
+        std::lock_guard<std::timed_mutex> lock(global_chunk_cache_mutex);
+        // Storage calls under the lock, like a write's, so /health reports
+        // one that stalls (and the test hook can hold it)
+        chunk_write_lock_timer lock_timer;
+#ifdef NTRACER_TEST_HOOKS
+        test_hold_write_lock();
+#endif
+
+        if (!is_valid || geometry() != g || file_gen.load() != expected_file_gen)
+        {
+            return false;
+        }
+        if (files_on_disk() != expected)
+        {
+            return false;
+        }
+
+        char line[sizeof(uint64_t) + sizeof(uint32_t)];
+        if (!pread_all(meta_fd, line, sizeof(line), g.header_size + (entry_file_line_size * id)))
+        {
+            return false;
+        }
+        metadata_entry now;
+        memcpy(&now.offset, line, sizeof(uint64_t));
+        memcpy(&now.size, line + sizeof(uint64_t), sizeof(uint32_t));
+        return now.offset == stamp.offset && now.size == stamp.size;
     }
 
     uint16_t read_pixel(size_t i, size_t j, size_t k)
@@ -2925,13 +3013,20 @@ public:
     // with and read from refuse the whole write. Then the chunks are written
     // in the order the voxel loop wrote them, except a partly covered chunk
     // that the request leaves exactly as it was stored.
+    //
+    // With skip_unchanged (SKIP_UNCHANGED_CHUNKS=1), a chunk the box covers
+    // entirely is read too, and one the request leaves exactly as stored is
+    // not written either, if its entry is still the one it was read under
+    // when that is checked again under the chunk cache lock (entry_still).
+    // A chunk that cannot be read is still replaced.
     bool replace_region(
         size_t scale,
         size_t xs, size_t xe,
         size_t ys, size_t ye,
         size_t zs, size_t ze,
         const char *data,
-        std::string &error)
+        std::string &error,
+        bool skip_unchanged = false)
     {
         const size_t osizex = xe - xs;
         const size_t osizey = ye - ys;
@@ -2947,6 +3042,10 @@ public:
             bool full;
             // The request changed a voxel of the stored chunk
             bool changed;
+            // With skip_unchanged: a chunk covered whole whose stored voxels
+            // were read, and the entry they were read under
+            bool stamped = false;
+            metadata_entry stamp{0, 0};
         };
 
         std::vector<region_shard> shards;
@@ -3053,6 +3152,12 @@ public:
             std::string refusal_where;
 
             shard_files files(s.data_gen);
+            // With skip_unchanged, chunks covered whole are read only from a
+            // zstd mchunk (a video frame is not what a write puts back), and
+            // in each mchunk only until reading one's entry fails (each such
+            // read retries and logs; a chunk whose data fails is still
+            // written, and the next one read)
+            bool read_full = skip_unchanged && s.g.compression_type == 1;
             const bool prepared = for_each_chunk(s, s.lx1, s.ly1, s.lz1, [&](const chunk_span &k) -> bool
                                                  {
                 write_chunk w{si, k, nullptr, false, false};
@@ -3060,7 +3165,43 @@ public:
                          k.y0 == k.cymin && k.y1 == k.cymin + k.cysize &&
                          k.z0 == k.czmin && k.z1 == k.czmin + k.czsize;
 
-                if (w.full)
+                if (w.full && read_full)
+                {
+                    // Every voxel of the chunk is overwritten, so what is read
+                    // only decides whether it must be written. One that cannot
+                    // be read is written, as without the switch, and this read
+                    // must not keep the request's later chunks from being read
+                    // (an open that failed here is tried again for them).
+                    const bool meta_unopenable = files.meta_unopenable;
+                    const bool data_unopenable = files.data_unopenable;
+                    bool load_failed = false;
+                    metadata_entry entry{0, 0};
+                    w.ptr = r->load_chunk(k.id, k.cxsize, k.cysize, k.czsize, &load_failed, &s.g, &files, &entry, true);
+                    if (w.ptr == nullptr)
+                    {
+                        refusal = "Out of memory";
+                        refusal_where = r->data_fname + " chunk " + std::to_string(k.id);
+                        return false;
+                    }
+                    if (load_failed)
+                    {
+                        files.meta_unopenable = meta_unopenable;
+                        files.data_unopenable = data_unopenable;
+                        // A failure with a size 0 entry is the entry's own: a
+                        // chunk never written loads without one
+                        if (entry.size == 0)
+                        {
+                            read_full = false;
+                        }
+                    }
+                    else if (get_fd_identity(files.meta_fd) == s.file_ids.meta &&
+                             (entry.size == 0 || get_fd_identity(files.data_fd) == s.file_ids.data))
+                    {
+                        w.stamped = true;
+                        w.stamp = entry;
+                    }
+                }
+                else if (w.full)
                 {
                     // Every voxel of the chunk is overwritten, so what is stored
                     // does not matter, and a chunk that cannot be read can be
@@ -3148,20 +3289,84 @@ public:
         // 4. Write back, in the order the voxel loop wrote (channel, mchunk,
         // chunk). A partly covered chunk the request left as it was stored is
         // skipped: rewriting it would only append the same voxels again.
+        // With skip_unchanged so is a chunk covered whole, if entry_still
+        // confirms what it was compared with is still what is stored; each
+        // mchunk's files are opened for that once, outside the lock.
+        struct skip_files
+        {
+            fd_closer meta, data;
+            bool opened = false;
+        };
+        std::unique_ptr<skip_files[]> skip_fds;
+        uint64_t skipped = 0;
+        if (skip_unchanged)
+        {
+            skip_fds.reset(new skip_files[shards.size()]);
+#ifdef NTRACER_TEST_HOOKS
+            if (std::any_of(chunks.begin(), chunks.end(), [](const write_chunk &w)
+                            { return w.full && !w.changed && w.stamped; }))
+            {
+                test_hold_before_skip_check();
+            }
+#endif
+        }
         bool all_written = true;
         for (write_chunk &w : chunks)
         {
             if (w.full || w.changed)
             {
-                const size_t chunk_size = w.span.cxsize * w.span.cysize * w.span.czsize * sizeof(uint16_t);
                 const region_shard &s = shards[w.shard];
-                if (!s.reader->overwrite_chunk(w.span.id, w.ptr, chunk_size, s.file_ids))
+                bool skip = false;
+                if (skip_unchanged && w.full)
                 {
-                    all_written = false;
+                    skip_chunks_covered.fetch_add(1);
+                    if (!w.changed && w.stamped)
+                    {
+                        skip_files &f = skip_fds[w.shard];
+                        if (!f.opened)
+                        {
+                            f.opened = true;
+                            f.meta.fd = open(s.reader->meta_fname.c_str(), O_RDONLY | O_CLOEXEC);
+                            f.data.fd = open(s.reader->data_fname.c_str(), O_RDONLY | O_CLOEXEC);
+                            // An open descriptor stays on its file, so this
+                            // needs checking once, here, outside the lock
+                            if (f.meta.fd < 0 || f.data.fd < 0 ||
+                                get_fd_identity(f.meta.fd) != s.file_ids.meta ||
+                                get_fd_identity(f.data.fd) != s.file_ids.data)
+                            {
+                                f.meta.close();
+                                f.data.close();
+                            }
+                        }
+                        skip = s.reader->entry_still(w.span.id, w.stamp, s.g, s.file_gen, s.file_ids, f.meta.fd, f.data.fd);
+                    }
+                }
+                if (skip)
+                {
+                    skipped++;
+                    skip_chunks_skipped.fetch_add(1);
+                }
+                else
+                {
+                    const size_t chunk_size = w.span.cxsize * w.span.cysize * w.span.czsize * sizeof(uint16_t);
+                    if (!s.reader->overwrite_chunk(w.span.id, w.ptr, chunk_size, s.file_ids))
+                    {
+                        all_written = false;
+                    }
                 }
             }
             free(w.ptr);
             w.ptr = nullptr;
+        }
+
+        if (skipped > 0)
+        {
+            std::string note;
+            if (log_limit_skipped.allow(note))
+            {
+                std::cerr << "Chunks left as stored because a write did not change them: " << skip_chunks_skipped.load()
+                          << " of " << skip_chunks_covered.load() << " covered whole since start" << note << std::endl;
+            }
         }
 
         if (!all_written)
