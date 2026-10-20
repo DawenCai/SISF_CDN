@@ -222,8 +222,9 @@ files, in between: the held PATCH must still land, or answer 500 for the
 replaced files, as without the switch; and `/health` must report a skip check
 held inside the chunk cache lock (`/data/.test_hold_write_lock`) as a write.
 Without the hook those cases are SKIPPED, and `--require-hook` makes that a
-failure. `concurrent_patch.py` takes `--env KEY=VALUE` and `--resend-half`
-for the same s19 run on its own.
+failure. CI runs it without `--require-hook` on the release and the sanitizer
+build after the harness. `concurrent_patch.py` takes `--env KEY=VALUE` and
+`--resend-half` for the same s19 run on its own.
 
 `stress_d6.py` is not part of the harness; CI runs `--mode patch` once (300
 PATCHes) on the candidate after it. It stresses stale chunks in the
