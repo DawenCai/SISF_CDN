@@ -113,6 +113,11 @@ size_t count_filter_items(const std::string &data_id_in, const std::string &name
 bool SKELETON_API_WRITES = false;
 log_limiter log_limit_skeleton_write;
 
+// SKIP_UNCHANGED_CHUNKS=1: a write leaves a chunk it covers whole as stored
+// when it does not change it (see replace_region). Off unless set to 1; off,
+// writes, /performance and the log are as before.
+bool SKIP_UNCHANGED_CHUNKS = false;
+
 crow::response skeleton_write_refused(const std::string &route, const std::string &data_id)
 {
 	std::string note;
@@ -329,6 +334,17 @@ int main(int argc, char *argv[])
 	}
 	std::cout << "skeleton_api writes: " << (SKELETON_API_WRITES ? "on" : "off (set SKELETON_API_WRITES=1 to allow upload, replace and delete)") << std::endl;
 
+	std::string skip_unchanged = read_env_variable("SKIP_UNCHANGED_CHUNKS");
+	if (skip_unchanged == "1")
+	{
+		SKIP_UNCHANGED_CHUNKS = true;
+		std::cout << "Unchanged chunks covered whole by a write: left as stored (SKIP_UNCHANGED_CHUNKS=1)" << std::endl;
+	}
+	else if (skip_unchanged.size() > 0 && skip_unchanged != "0")
+	{
+		std::cerr << "SKIP_UNCHANGED_CHUNKS ignored (not 0 or 1): " << skip_unchanged << std::endl;
+	}
+
 	std::string max_read_voxels = read_env_variable("MAX_READ_VOXELS");
 	if (max_read_voxels.size() > 0 && !parse_decimal(max_read_voxels, MAX_READ_VOXELS))
 	{
@@ -460,6 +476,11 @@ int main(int argc, char *argv[])
 		perf_counter_mutex.unlock();
 
 		out << "</table>\n";
+		if (SKIP_UNCHANGED_CHUNKS)
+		{
+			out << "<p>Chunks covered whole by writes: " << skip_chunks_covered.load()
+				<< "; left as stored because unchanged: " << skip_chunks_skipped.load() << "</p>\n";
+		}
 		out << "</body>\n";
 		out << "</html>";
 
@@ -1015,7 +1036,7 @@ int main(int argc, char *argv[])
 
 		std::string write_error;
 		if (!reader->replace_region(
-			scale, x_begin, x_end, y_begin, y_end, z_begin, z_end, insert.c_str(), write_error
+			scale, x_begin, x_end, y_begin, y_end, z_begin, z_end, insert.c_str(), write_error, SKIP_UNCHANGED_CHUNKS
 		))
 		{
 			res.code = crow::status::INTERNAL_SERVER_ERROR;

@@ -206,6 +206,26 @@ needs a build made with `-DNTRACER_TEST_HOOKS=ON` (a write then waits while
 `/data/.test_hold_write_lock` exists); on any other build that part is
 reported as SKIPPED, and `--require-hook` makes that a failure.
 
+`skip_unchanged.py --image IMAGE --work DIR [--rounds 40] [--require-hook]`
+checks `SKIP_UNCHANGED_CHUNKS=1` on one image, without a baseline, against a
+server of the same image with the switch off: a PATCH of exactly what a layer
+holds appends nothing (off: every chunk covered whole is appended again); one
+changed voxel appends one frame and moves one entry; a box covering chunks in
+part merges as before; zeros into an mchunk with no `.data` still answer 500,
+a chunk with a corrupt frame is still replaced (in a whole-layer PATCH, only
+that chunk is written), a video-compressed mchunk is still written; s19 with half the clients resending the same chunks; the
+`/performance` counter line only with the switch on, and the "0" and invalid
+settings. With a build made with `-DNTRACER_TEST_HOOKS=ON`, a PATCH waits
+before its skip check while `/data/.test_hold_skip_check` exists, and the
+script lands another PATCH into the same chunk, or replaces the mchunk's
+files, in between: the held PATCH must still land, or answer 500 for the
+replaced files, as without the switch; and `/health` must report a skip check
+held inside the chunk cache lock (`/data/.test_hold_write_lock`) as a write.
+Without the hook those cases are SKIPPED, and `--require-hook` makes that a
+failure. CI runs it without `--require-hook` on the release and the sanitizer
+build after the harness. `concurrent_patch.py` takes `--env KEY=VALUE` and
+`--resend-half` for the same s19 run on its own.
+
 `stress_d6.py` is not part of the harness; CI runs `--mode patch` once (300
 PATCHes) on the candidate after it. It stresses stale chunks in the
 chunk cache, which sit between two points inside the server and cannot be

@@ -1289,7 +1289,7 @@ def _concurrent_patches(server, reqs, timeout=SCENARIO_TIMEOUT):
     return out
 
 
-def sc_concurrent_patch(server, results, sid, rounds=CPATCH_ROUNDS, problems=None):
+def sc_concurrent_patch(server, results, sid, rounds=CPATCH_ROUNDS, problems=None, resend_half=False):
     """PATCHes sent at once into one mchunk of a writable layer. All chunks
     of an mchunk are appended to its one .data, and each PATCH records where
     its chunk went in the mchunk's one .meta; a server that lets two writes
@@ -1303,7 +1303,11 @@ def sc_concurrent_patch(server, results, sid, rounds=CPATCH_ROUNDS, problems=Non
     last, and the whole mchunk is read once more. Where the frames land in
     the .data depends on which write goes first, so the files' bytes are not
     compared across servers (the dataset is not in SCENARIO_DATASETS).
-    problems, when given, receives every problem found, one line each."""
+    problems, when given, receives every problem found, one line each.
+    With resend_half, from the second round on the clients with an odd
+    column x send again the contents they sent the round before (for
+    skip_unchanged.py, where those chunks are left as stored while the
+    other half are written beside them)."""
     ds = "sc_cpatch"
     c = CPATCH_CHUNK
     nx, ny, nz = CPATCH_GRID
@@ -1322,7 +1326,10 @@ def sc_concurrent_patch(server, results, sid, rounds=CPATCH_ROUNDS, problems=Non
     for rnd in range(rounds):
         reqs = []
         for cx, cz in clients:
-            column = [_cpatch_contents(rnd, cx, cy, cz) for cy in range(ny)]
+            if resend_half and rnd > 0 and cx % 2:
+                column = [last[(cx, cy, cz)] for cy in range(ny)]
+            else:
+                column = [_cpatch_contents(rnd, cx, cy, cz) for cy in range(ny)]
             last.update({(cx, cy, cz): a for cy, a in enumerate(column)})
             reqs.append((write + box(cx * c, cx * c + c, 0, Y, cz * c, cz * c + c),
                          np.concatenate(column, axis=1).tobytes()))

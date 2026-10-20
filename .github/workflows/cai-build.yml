@@ -89,6 +89,19 @@ jobs:
           python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6" \
             --mode patch --writes 300 --readers 8
 
+      # SKIP_UNCHANGED_CHUNKS is off in the harness above, and none of its
+      # requests resends a whole chunk unchanged, so it never reaches the skip
+      # path. This runs the candidate with the switch on against itself with
+      # it off, in the cases that need no hook build (those that do report
+      # SKIPPED), and fails on an AddressSanitizer report in either server's
+      # log. It runs even when the harness failed, so both results show.
+      - name: SKIP_UNCHANGED_CHUNKS (switch on against off)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        working-directory: tests/regress
+        run: |
+          python skip_unchanged.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/skip_unchanged"
+
       # ASan aborts on its first error, which the harness already fails as a
       # candidate crash; this step names the report. UBSan messages do not stop
       # the server and are listed only (known: crow.h bool loads, the point-cloud
