@@ -1189,13 +1189,11 @@ public:
         dilation_y = std::ceil(dilation_y);
         dilation_z = std::ceil(dilation_z);
 
-        size_x_out -= dilation_x;
-        size_y_out -= dilation_y;
-        size_z_out -= dilation_z;
-
-        size_x_out = std::max(size_x_out, (size_t)1);
-        size_y_out = std::max(size_y_out, (size_t)1);
-        size_z_out = std::max(size_z_out, (size_t)1);
+        // Unsigned subtraction would wrap when the dilation reaches the size
+        // (thin axes at high scales, e.g. 6 z slices at 8x), so clamp first.
+        size_x_out = size_x_out > dilation_x ? size_x_out - (size_t)dilation_x : 1;
+        size_y_out = size_y_out > dilation_y ? size_y_out - (size_t)dilation_y : 1;
+        size_z_out = size_z_out > dilation_z ? size_z_out - (size_t)dilation_z : 1;
 
         // std::cout << "Scale: " << scale << " " << dilation_x << " " << dilation_y << " " << dilation_z << std::endl;
 
@@ -1303,9 +1301,10 @@ public:
             std::set<std::tuple<size_t, size_t, size_t, size_t, size_t>> back_mchunks;
 
             // Scaled metachunk size
-            const size_t mcx = mchunkx / scale;
-            const size_t mcy = mchunky / scale;
-            const size_t mcz = mchunkz / scale;
+            // (at least 1: a metachunk thinner than the scale keeps one sample, and 0 would divide by zero below)
+            const size_t mcx = std::max((size_t)1, (size_t)(mchunkx / scale));
+            const size_t mcy = std::max((size_t)1, (size_t)(mchunky / scale));
+            const size_t mcz = std::max((size_t)1, (size_t)(mchunkz / scale));
 
             // Variables to store chunk reader and data (shared in loop)
             packed_reader *chunk_reader = nullptr;
@@ -1638,9 +1637,10 @@ public:
         std::map<uint16_t *, std::tuple<size_t, size_t, size_t>> chunk_sizes;
 
         // Scaled metachunk size
-        const size_t mcx = mchunkx / scale;
-        const size_t mcy = mchunky / scale;
-        const size_t mcz = mchunkz / scale;
+        // (at least 1: a metachunk thinner than the scale keeps one sample, and 0 would divide by zero below)
+        const size_t mcx = std::max((size_t)1, (size_t)(mchunkx / scale));
+        const size_t mcy = std::max((size_t)1, (size_t)(mchunky / scale));
+        const size_t mcz = std::max((size_t)1, (size_t)(mchunkz / scale));
 
         // Variables to store chunk reader and data (shared in loop)
         packed_reader *chunk_reader = nullptr;
