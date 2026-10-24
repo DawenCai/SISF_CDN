@@ -3,6 +3,8 @@
 // output byte order, without TensorStore.
 #include <cassert>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 
 #include "zarr_ngff.hpp"
@@ -267,12 +269,121 @@ static void test_byte_order()
     }
 }
 
+static void write_json(const std::string &path, const njson &j)
+{
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+    std::ofstream(path) << j.dump();
+}
+
+static void write_text(const std::string &path, const std::string &text)
+{
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+    std::ofstream(path) << text;
+}
+
+// A bad dataset must give false and a reason, never an exception
+static void expect_skip(const std::string &root, const char *needle)
+{
+    root_kind kind;
+    std::vector<level_view> levels;
+    std::string err;
+    bool ok = true;
+    try
+    {
+        ok = load_dataset_metadata(root, kind, levels, err);
+    }
+    catch (...)
+    {
+        assert(!"load_dataset_metadata threw");
+    }
+    if (ok || err.empty() || (needle != nullptr && err.find(needle) == std::string::npos))
+    {
+        std::cerr << root << ": ok=" << ok << " err=" << err << std::endl;
+        assert(false);
+    }
+    assert(levels.empty());
+}
+
+static void test_dataset_on_disk()
+{
+    namespace fs = std::filesystem;
+    const std::string base = fs::temp_directory_path().string() + "/sisf_zarr_ngff_test";
+    fs::remove_all(base);
+
+    // Good NGFF root, with a tiles/ subgroup and a side file that must be ignored
+    {
+        const std::string r = base + "/good";
+        write_json(r + "/zarr.json", root_group(true, njson::array({"1", "2", "4"})));
+        write_json(r + "/0/zarr.json", level_array({2, 40, 1000, 1200}, {1, 40, 512, 512}, {1, 40, 32, 32}));
+        write_json(r + "/1/zarr.json", level_array({2, 40, 500, 600}, {1, 40, 256, 256}, {1, 40, 32, 32}));
+        write_json(r + "/2/zarr.json", level_array({2, 20, 250, 300}, {1, 20, 128, 128}, {1, 20, 32, 32}));
+        write_json(r + "/tiles/zarr.json", njson{{"zarr_format", 3}, {"node_type", "group"}, {"attributes", njson::object()}});
+        write_text(r + "/transforms.json", "{}");
+        root_kind kind;
+        std::vector<level_view> levels;
+        std::string err;
+        assert(load_dataset_metadata(r, kind, levels, err));
+        assert(kind == root_kind::multiscale && levels.size() == 3 && levels[2].key == 4 && levels[1].size_x == 600);
+    }
+
+    // Legacy plain array root
+    {
+        const std::string r = base + "/legacy";
+        njson a = level_array({100, 80, 6, 2}, {100, 80, 6, 2}, {100, 80, 6, 2});
+        a.erase("dimension_names");
+        write_json(r + "/zarr.json", a);
+        root_kind kind;
+        std::vector<level_view> levels;
+        std::string err;
+        assert(load_dataset_metadata(r, kind, levels, err));
+        assert(kind == root_kind::plain_array && levels.size() == 1 && levels[0].key == 1 && levels[0].axes.positional);
+        assert(levels[0].size_x == 100 && levels[0].channels == 2);
+    }
+
+    // Broken roots: each is skipped with a reason
+    expect_skip(base + "/missing", "cannot open");
+
+    write_text(base + "/badjson/zarr.json", "{\"node_type\": \"group\", ");
+    expect_skip(base + "/badjson", "invalid JSON");
+
+    write_json(base + "/nolayout/zarr.json", njson{{"zarr_format", 3}});
+    expect_skip(base + "/nolayout", "node_type");
+
+    write_json(base + "/notngff/zarr.json", njson{{"zarr_format", 3}, {"node_type", "group"}, {"attributes", njson::object()}});
+    expect_skip(base + "/notngff", "multiscales");
+
+    write_json(base + "/nolevel/zarr.json", root_group(false));
+    expect_skip(base + "/nolevel", "cannot open");
+
+    // Wrong JSON types deep in the metadata (would throw inside nlohmann)
+    {
+        njson g = root_group(false);
+        g["attributes"]["ome"]["multiscales"][0]["datasets"][0]["coordinateTransformations"][0]["scale"] = {"a", "b", "c", "d"};
+        write_json(base + "/badtypes/zarr.json", g);
+        write_json(base + "/badtypes/0/zarr.json", level_array({1, 8, 64, 64}, {1, 8, 64, 64}, {1, 8, 32, 32}));
+        expect_skip(base + "/badtypes", "malformed metadata");
+
+        write_json(base + "/badshape/zarr.json", root_group(false));
+        njson a = level_array({1, 8, 64, 64}, {1, 8, 64, 64}, {1, 8, 32, 32});
+        a["shape"] = {"x", 8, 64, 64};
+        write_json(base + "/badshape/0/zarr.json", a);
+        expect_skip(base + "/badshape", "malformed metadata");
+    }
+
+    // Unsupported dtype at the root array
+    write_json(base + "/float/zarr.json", level_array({1, 8, 64, 64}, {1, 8, 64, 64}, {1, 8, 32, 32}, "float32"));
+    expect_skip(base + "/float", "float32");
+
+    fs::remove_all(base);
+}
+
 int main()
 {
     test_multiscale();
     test_units_and_dtype();
     test_axes();
     test_byte_order();
+    test_dataset_on_disk();
     std::cout << "zarr_ngff_test: all passed" << std::endl;
     return 0;
 }

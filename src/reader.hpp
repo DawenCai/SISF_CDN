@@ -2855,11 +2855,15 @@ public:
         else if (type == ZARR)
         {
             // Reads straight into out_buffer in the same layout as the SISF
-            // branch above (channel slowest, x fastest). On failure the
-            // buffer stays zero, as for a missing SISF chunk.
-            if (!zarr->read(scale, xs, xe, ys, ye, zs, ze, out_buffer))
+            // branch above (channel slowest, x fastest). Chunks that were
+            // never written read as the fill value. A real failure (level
+            // cannot be opened, I/O or decode error) throws zarr_read_error
+            // so only this request fails.
+            std::string err;
+            if (!zarr->read(scale, xs, xe, ys, ye, zs, ze, out_buffer, err))
             {
-                memset(out_buffer, 0, buffer_size);
+                free(out_buffer);
+                throw zarr_read_error("[" + fname + "] " + err);
             }
         }
         else if (type == DESCRIPTOR && parent_archive_inventory != nullptr)
@@ -2915,11 +2919,21 @@ public:
                 const int64_t region_y_size = y_overlap_end_shifted - y_overlap_start_shifted;
                 const int64_t region_z_size = z_overlap_end_shifted - z_overlap_start_shifted;
 
-                uint16_t *region = reader->second->load_region(
-                    scale,
-                    x_overlap_start_shifted, x_overlap_end_shifted,
-                    y_overlap_start_shifted, y_overlap_end_shifted,
-                    z_overlap_start_shifted, z_overlap_end_shifted);
+                uint16_t *region;
+                try
+                {
+                    region = reader->second->load_region(
+                        scale,
+                        x_overlap_start_shifted, x_overlap_end_shifted,
+                        y_overlap_start_shifted, y_overlap_end_shifted,
+                        z_overlap_start_shifted, z_overlap_end_shifted);
+                }
+                catch (...)
+                {
+                    // A Zarr source failed; fail this request without leaking the output
+                    free(out_buffer);
+                    throw;
+                }
 
                 const int64_t cin = l->source_channel;
                 const int64_t cout = l->target_channel;

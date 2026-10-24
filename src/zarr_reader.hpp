@@ -50,6 +50,7 @@ the level is read through TensorStore. Nothing is registered by default.
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -246,6 +247,14 @@ public:
 // Dataset
 // ----------------------------------------------------------------------
 
+// Thrown by archive_reader::load_region when a Zarr read fails, so the
+// request that hit it gets an HTTP error and the server keeps running.
+class zarr_read_error : public std::runtime_error
+{
+public:
+    explicit zarr_read_error(const std::string &msg) : std::runtime_error(msg) {}
+};
+
 class zarr_dataset
 {
 public:
@@ -253,34 +262,21 @@ public:
     bool multiscale = false; // false: plain array at the root
     std::vector<zarr_ngff::level_view> levels;
 
-    // Opens the dataset metadata. Throws std::runtime_error with a readable
-    // message when the root is neither a multiscale group nor a plain array,
-    // or when a level cannot be served.
+    // Opens the dataset metadata. Throws std::runtime_error with a one-line
+    // reason when the dataset cannot be served (missing or malformed
+    // zarr.json, unknown layout, unsupported dtype, a root array TensorStore
+    // cannot open). Nothing here aborts the process; the inventory loader
+    // catches the exception, logs it and skips only this dataset.
     explicit zarr_dataset(const std::string &root_in) : root(root_in)
     {
-        nlohmann::json meta;
+        zarr_ngff::root_kind kind;
         std::string err;
-        if (!read_json(root + "/zarr.json", meta, err))
-            fail(err);
+        if (!zarr_ngff::load_dataset_metadata(root, kind, levels, err))
+            throw std::runtime_error(err);
 
-        const std::string node_type = meta.contains("node_type") && meta["node_type"].is_string()
-                                          ? meta["node_type"].get<std::string>()
-                                          : "";
-
-        try
-        {
-            if (node_type == "group")
-                open_multiscale(meta);
-            else if (node_type == "array")
-                open_plain_array(meta);
-            else
-                fail("zarr.json has no node_type \"group\" or \"array\"");
-        }
-        catch (const nlohmann::json::exception &e)
-        {
-            // Metadata of an unexpected JSON type somewhere in the tree
-            fail(std::string("malformed metadata: ") + e.what());
-        }
+        multiscale = kind == zarr_ngff::root_kind::multiscale;
+        if (!multiscale)
+            open_plain_array();
 
         sources.resize(levels.size());
         source_mutexes.reset(new std::mutex[levels.size()]);
@@ -295,24 +291,33 @@ public:
     }
 
     // Read [xs, xe) x [ys, ye) x [zs, ze) of the level with scale key `key`
-    // into out (SISF block layout). out is left untouched on failure.
-    bool read(size_t key, size_t xs, size_t xe, size_t ys, size_t ye, size_t zs, size_t ze, uint16_t *out)
+    // into out (SISF block layout). Returns false with a reason in err when
+    // the level cannot be opened or read; out may then be partly written.
+    bool read(size_t key, size_t xs, size_t xe, size_t ys, size_t ye, size_t zs, size_t ze, uint16_t *out,
+              std::string &err)
     {
         const int i = zarr_ngff::find_level(levels, key);
         if (i < 0)
         {
-            std::cerr << "[" << root << "] no Zarr level for scale key " << key << std::endl;
+            err = "no level for scale key " + std::to_string(key);
             return false;
         }
 
-        zarr_level_source *src = get_source((size_t)i);
+        zarr_level_source *src = get_source((size_t)i, err);
         if (src == nullptr)
             return false;
 
-        std::string err;
-        if (!src->read(xs, xe, ys, ye, zs, ze, out, err))
+        try
         {
-            std::cerr << "[" << root << "/" << levels[i].path << "] " << err << std::endl;
+            if (!src->read(xs, xe, ys, ye, zs, ze, out, err))
+            {
+                err = "level \"" + levels[i].path + "\": " + err;
+                return false;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            err = "level \"" + levels[i].path + "\": " + e.what();
             return false;
         }
         return true;
@@ -323,82 +328,21 @@ private:
     std::unique_ptr<std::mutex[]> source_mutexes; // one per level, guards the lazy open
     std::unique_ptr<zarr_level_source> preopened;
 
-    [[noreturn]] void fail(const std::string &msg) const
-    {
-        std::cerr << "Zarr dataset [" << root << "]: " << msg << std::endl;
-        throw std::runtime_error(msg);
-    }
-
-    static bool read_json(const std::string &path, nlohmann::json &out, std::string &err)
-    {
-        std::ifstream f(path);
-        if (!f)
-        {
-            err = "cannot open " + path;
-            return false;
-        }
-        try
-        {
-            f >> out;
-        }
-        catch (const std::exception &e)
-        {
-            err = "invalid JSON in " + path + ": " + e.what();
-            return false;
-        }
-        return true;
-    }
-
     std::string level_dir(const zarr_ngff::level_view &v) const
     {
         return v.path.empty() ? root : root + "/" + v.path;
     }
 
-    void open_multiscale(const nlohmann::json &meta)
-    {
-        multiscale = true;
-        zarr_ngff::multiscale ms;
-        std::string err;
-        if (!zarr_ngff::parse_multiscale_group(meta, ms, err))
-            fail(err);
-
-        std::vector<zarr_ngff::array_meta> arrays;
-        for (const auto &l : ms.levels)
-        {
-            nlohmann::json am;
-            if (!read_json(root + "/" + l.path + "/zarr.json", am, err))
-                fail(err);
-            zarr_ngff::array_meta a;
-            if (!zarr_ngff::parse_array_meta(am, a, err))
-                fail("level \"" + l.path + "\": " + err);
-            arrays.push_back(a);
-        }
-
-        if (!zarr_ngff::build_multiscale_views(ms, arrays, levels, err))
-            fail(err);
-    }
-
     // The original ZARR dataset type: one array at the root, served as key 1.
     // Opened now (as before) so its resolution can come from TensorStore's
     // dimension units; the open store is kept and reused for every request.
-    void open_plain_array(const nlohmann::json &meta)
+    void open_plain_array()
     {
-        multiscale = false;
-        std::string err;
-
-        zarr_ngff::level_view v;
-        v.path = "";
-        v.key = 1;
-        if (!zarr_ngff::parse_array_meta(meta, v.array, err))
-            fail(err);
-        if (!zarr_ngff::resolve_axes(v.array.dimension_names, v.array.shape.size(), v.axes, err))
-            fail(err);
-        if (!zarr_ngff::fill_level_view(v, err))
-            fail(err);
+        zarr_ngff::level_view &v = levels[0];
 
         auto store = zarr_open_array(root);
         if (!store.ok())
-            fail(std::string("cannot open array: ") + store.status().ToString());
+            throw std::runtime_error(std::string("cannot open array: ") + store.status().ToString());
 
         // Resolution from dimension units when they are set, else 100 nm (as before).
         v.res_nm_x = v.res_nm_y = v.res_nm_z = 100;
@@ -422,11 +366,10 @@ private:
             }
         }
 
-        levels.push_back(v);
         preopened.reset(new tensorstore_level_source(std::move(*store), v));
     }
 
-    zarr_level_source *get_source(size_t i)
+    zarr_level_source *get_source(size_t i, std::string &err)
     {
         std::lock_guard<std::mutex> lock(source_mutexes[i]);
         if (sources[i])
@@ -435,26 +378,34 @@ private:
         const zarr_ngff::level_view &v = levels[i];
         const std::string dir = level_dir(v);
 
-        for (auto &factory : zarr_custom_level_sources())
+        try
         {
-            std::unique_ptr<zarr_level_source> s = factory(dir, v);
-            if (s)
+            for (auto &factory : zarr_custom_level_sources())
             {
-                sources[i] = std::move(s);
-                return sources[i].get();
+                std::unique_ptr<zarr_level_source> s = factory(dir, v);
+                if (s)
+                {
+                    sources[i] = std::move(s);
+                    return sources[i].get();
+                }
             }
         }
+        catch (const std::exception &e)
+        {
+            err = "custom decoder for level \"" + v.path + "\" failed: " + e.what();
+            return nullptr;
+        }
 
+        // A failed open is not cached, so the next request retries it.
         auto store = zarr_open_array(dir);
         if (!store.ok())
         {
-            // Not cached, so the next request retries the open.
-            std::cerr << "[" << dir << "] cannot open Zarr array: " << store.status() << std::endl;
+            err = "cannot open level \"" + v.path + "\": " + store.status().ToString();
             return nullptr;
         }
         if ((size_t)store->rank() != v.array.shape.size())
         {
-            std::cerr << "[" << dir << "] rank differs from zarr.json" << std::endl;
+            err = "level \"" + v.path + "\": rank differs from zarr.json";
             return nullptr;
         }
 

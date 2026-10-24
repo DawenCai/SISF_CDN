@@ -195,9 +195,14 @@ void load_inventory()
 			{
 				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
 			}
+			catch (const std::exception &e)
+			{
+				// Skip only this dataset, keep serving the others
+				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
+			}
 			catch (...)
 			{
-				std::cout << "[FAIL] " << dset_name << std::endl;
+				std::cout << "[FAIL] " << dset_name << ": unknown error" << std::endl;
 			}
 		}
 	}
@@ -231,9 +236,14 @@ void load_inventory()
 			{
 				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
 			}
+			catch (const std::exception &e)
+			{
+				// Skip only this dataset, keep serving the others
+				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
+			}
 			catch (...)
 			{
-				std::cout << "[FAIL] " << dset_name << std::endl;
+				std::cout << "[FAIL] " << dset_name << ": unknown error" << std::endl;
 			}
 		}
 	}
@@ -260,9 +270,14 @@ void load_inventory()
 				std::cout << "[SISF-JSON] ";
 				archive_inventory[dset_name]->print_info();
 			}
+			catch (const std::exception &e)
+			{
+				// Skip only this dataset, keep serving the others
+				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
+			}
 			catch (...)
 			{
-				std::cout << "[FAIL] " << dset_name << std::endl;
+				std::cout << "[FAIL] " << dset_name << ": unknown error" << std::endl;
 			}
 		}
 	}
@@ -303,9 +318,14 @@ void load_inventory()
 			{
 				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
 			}
+			catch (const std::exception &e)
+			{
+				// Skip only this dataset, keep serving the others
+				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
+			}
 			catch (...)
 			{
-				std::cout << "[FAIL] " << dset_name << std::endl;
+				std::cout << "[FAIL] " << dset_name << ": unknown error" << std::endl;
 			}
 		}
 	}
@@ -2709,14 +2729,24 @@ int main(int argc, char *argv[])
 			const size_t y_project_size = y_end_project - y_begin_project;
 			const size_t z_project_size = z_end_project - z_begin_project;
 
-			uint16_t * tmp_buffer = reader->load_region(
-				scale,
-				x_begin_project, x_end_project,
-				y_begin_project, y_end_project,
-				z_begin_project, z_end_project,
-				strict_read ? &read_failed : nullptr,
-				channel
-			);
+			uint16_t * tmp_buffer;
+			try {
+				tmp_buffer = reader->load_region(
+					scale,
+					x_begin_project, x_end_project,
+					y_begin_project, y_end_project,
+					z_begin_project, z_end_project,
+					strict_read ? &read_failed : nullptr,
+					channel
+				);
+			} catch (const std::exception &e) {
+				// Read failure on this dataset: fail this request only
+				std::cerr << "READ failed: " << e.what() << std::endl;
+				free(out_buffer);
+				res.code = crow::status::INTERNAL_SERVER_ERROR;
+				res.end("500 Internal Server Error -- read failed\n");
+				return;
+			}
 			if (tmp_buffer == NULL)
 			{
 				free(out_buffer);
@@ -2810,14 +2840,22 @@ int main(int argc, char *argv[])
 			free(tmp_buffer);
 		} else {
 			// Load unprojected data
-			out_buffer = reader->load_region(
-				scale,
-				x_begin, x_end,
-				y_begin, y_end,
-				z_begin, z_end,
-				strict_read ? &read_failed : nullptr,
-				channel
-			);
+			try {
+				out_buffer = reader->load_region(
+					scale,
+					x_begin, x_end,
+					y_begin, y_end,
+					z_begin, z_end,
+					strict_read ? &read_failed : nullptr,
+					channel
+				);
+			} catch (const std::exception &e) {
+				// Read failure on this dataset: fail this request only
+				std::cerr << "READ failed: " << e.what() << std::endl;
+				res.code = crow::status::INTERNAL_SERVER_ERROR;
+				res.end("500 Internal Server Error -- read failed\n");
+				return;
+			}
 			if (out_buffer == NULL)
 			{
 				res.code = crow::status::INTERNAL_SERVER_ERROR;

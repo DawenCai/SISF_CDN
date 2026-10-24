@@ -36,6 +36,7 @@ Supported layouts
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <set>
 #include <sstream>
 #include <string>
@@ -653,6 +654,113 @@ namespace zarr_ngff
             out.push_back(v);
         }
         return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Dataset root on disk
+    // ------------------------------------------------------------------
+
+    enum class root_kind
+    {
+        multiscale,  // OME-NGFF multiscale group
+        plain_array  // a single Zarr v3 array at the root
+    };
+
+    inline bool read_json_file(const std::string &path, njson &out, std::string &err)
+    {
+        std::ifstream f(path);
+        if (!f)
+        {
+            err = "cannot open " + path;
+            return false;
+        }
+        try
+        {
+            f >> out;
+        }
+        catch (const std::exception &e)
+        {
+            err = "invalid JSON in " + path + ": " + e.what();
+            return false;
+        }
+        return true;
+    }
+
+    // Read <root>/zarr.json and, for a multiscale group, every level's
+    // zarr.json, and build the served level views. For a plain array the
+    // single level has key 1 and its resolution is left at 0 for the caller
+    // to fill. Never throws: any problem (missing file, invalid JSON, wrong
+    // JSON types, unknown layout, unsupported dtype) returns false with a
+    // one-line reason in err, so the caller can skip just this dataset.
+    inline bool load_dataset_metadata(const std::string &root, root_kind &kind, std::vector<level_view> &levels,
+                                      std::string &err)
+    {
+        levels.clear();
+        try
+        {
+            njson meta;
+            if (!read_json_file(root + "/zarr.json", meta, err))
+                return false;
+
+            const std::string node_type = meta.is_object() && meta.contains("node_type") && meta["node_type"].is_string()
+                                              ? meta["node_type"].get<std::string>()
+                                              : "";
+
+            if (node_type == "group")
+            {
+                kind = root_kind::multiscale;
+                multiscale ms;
+                if (!parse_multiscale_group(meta, ms, err))
+                    return false;
+
+                std::vector<array_meta> arrays;
+                for (const auto &l : ms.levels)
+                {
+                    njson am;
+                    if (!read_json_file(root + "/" + l.path + "/zarr.json", am, err))
+                        return false;
+                    array_meta a;
+                    if (!parse_array_meta(am, a, err))
+                    {
+                        err = "level \"" + l.path + "\": " + err;
+                        return false;
+                    }
+                    arrays.push_back(a);
+                }
+                return build_multiscale_views(ms, arrays, levels, err);
+            }
+
+            if (node_type == "array")
+            {
+                kind = root_kind::plain_array;
+                level_view v;
+                v.path = "";
+                v.key = 1;
+                if (!parse_array_meta(meta, v.array, err))
+                    return false;
+                if (!resolve_axes(v.array.dimension_names, v.array.shape.size(), v.axes, err))
+                    return false;
+                if (!fill_level_view(v, err))
+                    return false;
+                levels.push_back(v);
+                return true;
+            }
+
+            err = "zarr.json has no node_type \"group\" or \"array\"";
+            return false;
+        }
+        catch (const std::exception &e)
+        {
+            levels.clear();
+            err = std::string("malformed metadata: ") + e.what();
+            return false;
+        }
+        catch (...)
+        {
+            levels.clear();
+            err = "malformed metadata";
+            return false;
+        }
     }
 
     inline int find_level(const std::vector<level_view> &levels, size_t key)

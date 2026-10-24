@@ -53,6 +53,8 @@ A directory under the data path whose `zarr.json` is a Zarr v3 group with OME-NG
 
 A directory whose `zarr.json` is a plain Zarr v3 array is served as a single level with resolution id `1` (axes from `dimension_names`, or x, y, z, c by position when unnamed).
 
+A dataset that cannot be opened (missing or malformed `zarr.json`, unknown layout, unsupported data type) is skipped with one `[FAIL] <dataset>: <reason>` line at load or reload; the other datasets keep being served. A read error on a Zarr level (the level cannot be opened, I/O or decode error) fails only that request with HTTP 500.
+
 Every level array is opened once and kept. All Zarr datasets share one TensorStore context whose cache pool (decoded chunks and shard indices) is bounded by `ZARR_CACHE_POOL_BYTES` (default 1073741824, `0` disables caching).
 
 ## Image Filtering
