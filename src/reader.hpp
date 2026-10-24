@@ -1241,13 +1241,13 @@ public:
                 }
                 else if (std::get<3>(decode_result) == sizeof(uint8_t))
                 {
-                    read_decomp_buffer = (char *)uint8_to_uint16_crop(read_decomp_buffer_pt, decomp_size, width, height, depth, sizex, sizey, sizez);
+                    read_decomp_buffer = (char *)uint8_to_uint16_crop(read_decomp_buffer_pt, decomp_size, depth, height, width, sizex, sizey, sizez);
                     decomp_size = sizex * sizey * sizez * sizeof(uint16_t);
                     free(read_decomp_buffer_pt);
                 }
                 else if (std::get<3>(decode_result) == sizeof(uint16_t))
                 {
-                    read_decomp_buffer = (char *)uint16_to_uint16_crop((uint16_t *)read_decomp_buffer_pt, decomp_size, width, height, depth, sizex, sizey, sizez);
+                    read_decomp_buffer = (char *)uint16_to_uint16_crop((uint16_t *)read_decomp_buffer_pt, decomp_size / sizeof(uint16_t), depth, height, width, sizex, sizey, sizez);
                     decomp_size = sizex * sizey * sizez * sizeof(uint16_t);
                     free(read_decomp_buffer_pt);
                 }
