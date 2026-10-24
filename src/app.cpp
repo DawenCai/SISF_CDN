@@ -184,9 +184,16 @@ void load_inventory()
 
 			try
 			{
-				archive_inventory[dset_name] = new archive_reader(froot, ZARR);
+				// build first, then register: a dataset that fails to open is skipped and never
+				// leaves an empty entry that a later request would dereference
+				archive_reader *reader = new archive_reader(froot, ZARR);
+				archive_inventory[dset_name] = reader;
 				std::cout << "[ZARR] ";
-				archive_inventory[dset_name]->print_info();
+				reader->print_info();
+			}
+			catch (const std::exception &e)
+			{
+				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
 			}
 			catch (...)
 			{
@@ -213,9 +220,16 @@ void load_inventory()
 
 			try
 			{
-				archive_inventory[dset_name] = new archive_reader(froot, SISF);
+				// build first, then register: a dataset that fails to open is skipped and never
+				// leaves an empty entry that a later request would dereference
+				archive_reader *reader = new archive_reader(froot, SISF);
+				archive_inventory[dset_name] = reader;
 				std::cout << "[SISF] ";
-				archive_inventory[dset_name]->print_info();
+				reader->print_info();
+			}
+			catch (const std::exception &e)
+			{
+				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
 			}
 			catch (...)
 			{
@@ -278,9 +292,16 @@ void load_inventory()
 
 			try
 			{
-				archive_inventory[dset_name] = new archive_reader(froot, DESCRIPTOR, &archive_inventory);
+				// build first, then register: a dataset that fails to open is skipped and never
+				// leaves an empty entry that a later request would dereference
+				archive_reader *reader = new archive_reader(froot, DESCRIPTOR, &archive_inventory);
+				archive_inventory[dset_name] = reader;
 				std::cout << "[DESCRIPTOR] ";
-				archive_inventory[dset_name]->print_info();
+				reader->print_info();
+			}
+			catch (const std::exception &e)
+			{
+				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
 			}
 			catch (...)
 			{
