@@ -38,6 +38,7 @@ Licensed under the terms specified in LICENSE.md
 #include <nlohmann/json.hpp>
 
 #include "vidlib.hpp"
+#include "zarr_reader.hpp"
 
 #include "../zstd/lib/zstd.h"
 
@@ -1733,120 +1734,44 @@ public:
         }
     }
 
-    // Opened once in load_metadata_zarr and reused by every request
-    tensorstore::TensorStore<> zarr_store;
+    // Zarr v3 dataset: an OME-NGFF multiscale group or a plain array at the
+    // root (see zarr_ngff.hpp). Level arrays are opened once and kept, see
+    // zarr_reader.hpp for the shared cache.
+    zarr_dataset *zarr = nullptr;
 
     void load_metadata_zarr()
     {
-        auto store_future = tensorstore::Open({{"driver", "zarr3"},
-                                               {"kvstore", {{"driver", "file"}, {"path", fname}}}},
-                                              zarr_context(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
+        // Throws with a readable message when the dataset cannot be served
+        zarr = new zarr_dataset(fname);
 
-        auto store_result = store_future.result();
+        const zarr_ngff::level_view &l0 = zarr->levels[0];
 
-        if (!store_result.ok())
-        {
-            // Skip this dataset; .value() on the error would abort the whole server
-            std::cerr << "Error opening TensorStore [" << fname << "]: " << store_result.status() << std::endl;
-            is_valid = false;
-            return;
-        }
-
-        zarr_store = std::move(store_result.value());
-        auto &store = zarr_store;
-
-        auto domain = store.domain();
-        auto shape = domain.shape();
-        auto labels = domain.labels();
-
-        sizex = 0;
-        sizey = 0;
-        sizez = 0;
-        channel_count = 0;
-
-        size_t i = 0;
-        for (const auto &dim : shape)
-        {
-            switch (i)
-            {
-            case 0: // x
-                sizex = dim;
-                break;
-            case 1: // y
-                sizey = dim;
-                break;
-            case 2: // z
-                sizez = dim;
-                break;
-            case 3: // c
-                channel_count = dim;
-                break;
-            }
-
-            i++;
-        }
-
-        if (sizex == 0 || sizey == 0 || sizez == 0 || channel_count == 0)
-        {
-            std::cerr << "Invalid rank in Zarr dataset [" << fname << "]. Found i=" << i << std::endl;
-        }
+        sizex = l0.size_x;
+        sizey = l0.size_y;
+        sizez = l0.size_z;
+        channel_count = (uint16_t)l0.channels;
 
         archive_version = 0;
-        dtype = 1;
+        dtype = 1; // served as uint16 (uint8 arrays are widened on read)
 
-        // TODO Load res from ts
-        resx = 100;
-        resy = 100;
-        resz = 100;
+        // Integer nm for the inventory page; /info uses the exact values (get_res_nm)
+        resx = (uint64_t)std::llround(l0.res_nm_x);
+        resy = (uint64_t)std::llround(l0.res_nm_y);
+        resz = (uint64_t)std::llround(l0.res_nm_z);
 
-        auto dim_units_result = store.dimension_units();
+        // Shard (or chunk) shape of level 0 in place of the SISF metachunk
+        mchunkx = (uint16_t)std::min(l0.chunk_x, (size_t)UINT16_MAX);
+        mchunky = (uint16_t)std::min(l0.chunk_y, (size_t)UINT16_MAX);
+        mchunkz = (uint16_t)std::min(l0.chunk_z, (size_t)UINT16_MAX);
 
-        if (!dim_units_result.ok())
+        mcountx = (sizex + l0.chunk_x - 1) / l0.chunk_x;
+        mcounty = (sizey + l0.chunk_y - 1) / l0.chunk_y;
+        mcountz = (sizez + l0.chunk_z - 1) / l0.chunk_z;
+
+        for (const auto &l : zarr->levels)
         {
-            std::cerr << "Error reading dimension_units from TensorStore: " << store_result.status() << std::endl;
+            scales.push_back(l.key);
         }
-        else
-        {
-            auto dim_units = dim_units_result.value();
-
-            for (size_t i = 0; i < dim_units.size(); i++)
-            {
-                if (dim_units[i].has_value())
-                {
-                    tensorstore::Unit u = dim_units[i].value();
-
-                    // TODO Verify that unit is nm and scale properly
-
-                    switch (i)
-                    {
-                    case 0: // x
-                        resx = u.multiplier;
-                        break;
-                    case 1: // y
-                        resy = u.multiplier;
-                        break;
-                    case 2: // z
-                        resz = u.multiplier;
-                        break;
-                    case 3: // c
-                        // Color does not have a unit
-                        break;
-                    }
-
-                    // std::cout << "Name: " << labels[i] << '\t' << u.to_string() << '\t' << u.base_unit << '\t' << u.multiplier << std::endl;
-                }
-            }
-        }
-
-        mchunkx = sizex;
-        mchunky = sizey;
-        mchunkz = sizez;
-
-        mcountx = 1;
-        mcounty = 1;
-        mcountz = 1;
-
-        scales.push_back(1);
     }
 
     // The dataset cannot be served. load_inventory catches this and prints
@@ -2139,6 +2064,17 @@ public:
 
     std::tuple<size_t, size_t, size_t> get_size(size_t scale)
     {
+        if (type == ZARR)
+        {
+            // Each Zarr level has its own shape
+            const zarr_ngff::level_view *l = zarr->level_for_key(scale);
+            if (l == nullptr)
+            {
+                return std::make_tuple((size_t)1, (size_t)1, (size_t)1);
+            }
+            return std::make_tuple(l->size_x, l->size_y, l->size_z);
+        }
+
         size_t size_x_out = sizex / scale;
         size_t size_y_out = sizey / scale;
         size_t size_z_out = sizez / scale;
@@ -2219,8 +2155,63 @@ public:
         return (size_t)((double)res1 * size1 / size_s);
     }
 
+    // Voxel size in nm per axis at this scale, unrounded
+    std::tuple<double, double, double> get_res_nm(size_t scale)
+    {
+        if (type == ZARR)
+        {
+            const zarr_ngff::level_view *l = zarr->level_for_key(scale);
+            if (l != nullptr)
+            {
+                return std::make_tuple(l->res_nm_x, l->res_nm_y, l->res_nm_z);
+            }
+        }
+
+        std::tuple<size_t, size_t, size_t> r = get_res(scale);
+        return std::make_tuple((double)std::get<0>(r), (double)std::get<1>(r), (double)std::get<2>(r));
+    }
+
+    // Downsampling factor of this scale along one axis ('x', 'y' or 'z').
+    // SISF scales are isotropic; Zarr levels may differ per axis.
+    size_t get_axis_factor(size_t scale, char axis)
+    {
+        if (type != ZARR)
+        {
+            return scale;
+        }
+
+        const zarr_ngff::level_view *l = zarr->level_for_key(scale);
+        const zarr_ngff::level_view &l0 = zarr->levels[0];
+        if (l == nullptr)
+        {
+            return scale;
+        }
+
+        double f = 1;
+        switch (axis)
+        {
+        case 'x':
+            f = l->res_nm_x / l0.res_nm_x;
+            break;
+        case 'y':
+            f = l->res_nm_y / l0.res_nm_y;
+            break;
+        default:
+            f = l->res_nm_z / l0.res_nm_z;
+            break;
+        }
+
+        return (size_t)std::max((long long)1, std::llround(f));
+    }
+
     std::tuple<size_t, size_t, size_t> get_res(size_t scale)
     {
+        if (type == ZARR)
+        {
+            std::tuple<double, double, double> r = get_res_nm(scale);
+            return std::make_tuple((size_t)std::get<0>(r), (size_t)std::get<1>(r), (size_t)std::get<2>(r));
+        }
+
         std::tuple<size_t, size_t, size_t> size = this->get_size(scale);
         return std::make_tuple(level_res(resx, sizex, mchunkx, mcountx, std::get<0>(size), scale),
                                level_res(resy, sizey, mchunky, mcounty, std::get<1>(size), scale),
@@ -2863,54 +2854,12 @@ public:
         }
         else if (type == ZARR)
         {
+            // Reads straight into out_buffer in the same layout as the SISF
+            // branch above (channel slowest, x fastest). On failure the
+            // buffer stays zero, as for a missing SISF chunk.
+            if (!zarr->read(scale, xs, xe, ys, ye, zs, ze, out_buffer))
             {
-                auto &store = zarr_store;
-
-                auto array_result = tensorstore::Read<tensorstore::zero_origin>(
-                                        store | tensorstore::AllDims().SizedInterval(
-                                                    {(tensorstore::Index)xs, (tensorstore::Index)ys, (tensorstore::Index)zs, 0},
-                                                    {(tensorstore::Index)osizex, (tensorstore::Index)osizey, (tensorstore::Index)osizez, (tensorstore::Index)channel_count}))
-                                        .result();
-
-                if (array_result.ok())
-                {
-                    // tensorstore::Array<tensorstore::Shared<void>, -1, tensorstore::ArrayOriginKind::offset, tensorstore::ContainerKind::container>
-                    auto array = array_result.value();
-
-                    // TODO detect datatype automatically
-                    uint16_t *array_ptr = (uint16_t *)array.data();
-
-                    // std::cout << "s:" << array.num_elements() << std::endl;
-                    // Access example: std::cout << "T: " << array[{xs, ys, zs, 0}] << std::endl;
-
-                    for (size_t c = 0; c < channel_count; c++)
-                    {
-                        for (size_t i = xs; i < xe; i++)
-                        {
-                            for (size_t j = ys; j < ye; j++)
-                            {
-                                for (size_t k = zs; k < ze; k++)
-                                {
-                                    // Calculate the coordinates of the input and output inside their respective buffers
-                                    const size_t coffset = ((i - xs) * osizey * osizez * channel_count) + // X
-                                                           ((j - ys) * osizez * channel_count) +          // Y
-                                                           (k - zs) * channel_count + c;                  // Z and C
-
-                                    const size_t ooffset = (c * osizey * osizex * osizez) + // C
-                                                           ((k - zs) * osizey * osizex) +   // Z
-                                                           ((j - ys) * osizex) +            // Y
-                                                           ((i - xs));                      // X
-
-                                    out_buffer[ooffset] = array_ptr[coffset];
-                                }
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    std::cerr << "Error reading from TensorStore: " << array_result.status() << std::endl;
-                }
+                memset(out_buffer, 0, buffer_size);
             }
         }
         else if (type == DESCRIPTOR && parent_archive_inventory != nullptr)
@@ -3414,6 +3363,22 @@ public:
             std::cout << n << ',';
 
         std::cout << "]" << std::endl;
+
+        if (type == ZARR)
+        {
+            std::cout << "\t" << (zarr->multiscale ? "OME-NGFF multiscale" : "plain array") << std::endl;
+            for (const auto &l : zarr->levels)
+            {
+                std::cout << "\t[level \"" << l.path << "\"] key=" << l.key
+                          << " dtype=" << zarr_ngff::sample_type_name(l.dtype)
+                          << " size=(" << l.size_x << ", " << l.size_y << ", " << l.size_z << ")"
+                          << " res_nm=(" << l.res_nm_x << ", " << l.res_nm_y << ", " << l.res_nm_z << ")"
+                          << " shard=(" << l.chunk_x << ", " << l.chunk_y << ", " << l.chunk_z << ")"
+                          << " chunk=(" << l.inner_x << ", " << l.inner_y << ", " << l.inner_z << ")"
+                          << (l.axes.positional ? " axes=positional(x,y,z,c)" : "")
+                          << std::endl;
+            }
+        }
 
         if (type == DESCRIPTOR)
         {

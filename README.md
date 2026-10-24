@@ -41,6 +41,20 @@ These functions allow accessing tiled data, one tile at a time. Notably, this ig
 | `/<dataset id>/raw_access/<c>,<i>,<j>,<k>/info` | Returns a Neuroglancer-formatted info file for the SISF chunk represented by color `c`, and chunk coordinate `i,j,k` | 
 | `/<dataset id>/raw_access/<c>,<i>,<j>,<k>/<res>/<xs>-<xe>_<ys>-<ye>_<zs>-<ze>` | Downloads a Fortran-order image chunk of the region defined by the boundary `[xs,xe)`, `[ys,ye)`, `[zs,ze)` and resolution id `res` | 
 
+## Zarr v3 / OME-NGFF datasets
+
+A directory under the data path whose `zarr.json` is a Zarr v3 group with OME-NGFF `multiscales` metadata (OME-NGFF 0.5, `attributes.ome.multiscales`) is served as a multiscale image:
+
+* Each entry of `datasets` is one pyramid level and must be a Zarr v3 array (sharded or not). Other members of the group are ignored.
+* Axis order is read from the NGFF `axes` (or the array `dimension_names`), so `(c, z, y, x)` and `(t, c, z, y, x)` arrays are read correctly; a `t` axis is read at index 0.
+* The resolution id of level `i` is `attributes.stitchreg.level_keys[i]` (or `attributes.sisf.level_keys[i]`) when present, else `2^i`, so ids `1`, `2`, `4` mean the same as for SISF datasets.
+* `/info` lists one scale per level with that level's own size and per-axis `resolution` in nm, taken unrounded from the level's `scale` transform. Downsampling may differ per axis.
+* `uint16` arrays are served as is, `uint8` arrays are widened to `uint16`. Other data types are rejected when the dataset is loaded.
+
+A directory whose `zarr.json` is a plain Zarr v3 array is served as a single level with resolution id `1` (axes from `dimension_names`, or x, y, z, c by position when unnamed).
+
+Every level array is opened once and kept. All Zarr datasets share one TensorStore context whose cache pool (decoded chunks and shard indices) is bounded by `ZARR_CACHE_POOL_BYTES` (default 1073741824, `0` disables caching).
+
 ## Image Filtering
 
 The CDN image access commands supports a collection of image filters which are appended to the end of the `dataset id` specification.

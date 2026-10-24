@@ -659,6 +659,16 @@ int main(int argc, char *argv[])
 			to_add["key"] = std::to_string(scale);
 			to_add["resolution"] = res;
 
+			if(reader->type == ZARR) {
+				// Zarr levels carry their own per-axis voxel size (nm), sent unrounded
+				std::tuple<double, double, double> res_nm = reader->get_res_nm(scale);
+				to_add["resolution"] = {
+					std::get<0>(res_nm),
+					std::get<1>(res_nm),
+					std::get<2>(res_nm)
+				};
+			}
+
 			std::tuple<size_t, size_t, size_t> sizes = reader->get_size(scale);
 			to_add["size"] = {
 				std::get<0>(sizes),
@@ -2597,8 +2607,8 @@ int main(int argc, char *argv[])
 				}
 			}
 
-			// Scale frame count by downsampling
-			project_frames /= scale;
+			// Scale frame count by downsampling (per axis for Zarr levels)
+			project_frames /= reader->get_axis_factor(scale, project_axis);
 			if(project_frames < 1) {
 				project_frames = 1;
 			}
