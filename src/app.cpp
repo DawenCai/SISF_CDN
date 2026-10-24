@@ -195,11 +195,6 @@ void load_inventory()
 			{
 				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
 			}
-			catch (const std::exception &e)
-			{
-				// Skip only this dataset, keep serving the others
-				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
-			}
 			catch (...)
 			{
 				std::cout << "[FAIL] " << dset_name << ": unknown error" << std::endl;
@@ -236,11 +231,6 @@ void load_inventory()
 			{
 				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
 			}
-			catch (const std::exception &e)
-			{
-				// Skip only this dataset, keep serving the others
-				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
-			}
 			catch (...)
 			{
 				std::cout << "[FAIL] " << dset_name << ": unknown error" << std::endl;
@@ -266,13 +256,15 @@ void load_inventory()
 
 			try
 			{
-				archive_inventory[dset_name] = new archive_reader(froot, SISF_JSON);
+				// build first, then register: a dataset that fails to open is skipped and never
+				// leaves an empty entry that a later request would dereference
+				archive_reader *reader = new archive_reader(froot, SISF_JSON);
+				archive_inventory[dset_name] = reader;
 				std::cout << "[SISF-JSON] ";
-				archive_inventory[dset_name]->print_info();
+				reader->print_info();
 			}
 			catch (const std::exception &e)
 			{
-				// Skip only this dataset, keep serving the others
 				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
 			}
 			catch (...)
@@ -318,11 +310,6 @@ void load_inventory()
 			{
 				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
 			}
-			catch (const std::exception &e)
-			{
-				// Skip only this dataset, keep serving the others
-				std::cout << "[FAIL] " << dset_name << ": " << e.what() << std::endl;
-			}
 			catch (...)
 			{
 				std::cout << "[FAIL] " << dset_name << ": unknown error" << std::endl;
@@ -338,7 +325,7 @@ archive_reader *search_inventory(std::string key)
 	auto archive_search = archive_inventory.find(key);
 	if (archive_search != archive_inventory.end())
 	{
-		if (archive_search->second->is_valid)
+		if (archive_search->second != nullptr && archive_search->second->is_valid)
 		{
 			return archive_search->second;
 		}
@@ -353,7 +340,7 @@ archive_reader *search_inventory(std::string key)
 	archive_search = archive_inventory.find(key);
 	if (archive_search != archive_inventory.end())
 	{
-		if (archive_search->second->is_valid)
+		if (archive_search->second != nullptr && archive_search->second->is_valid)
 		{
 			return archive_search->second;
 		}
