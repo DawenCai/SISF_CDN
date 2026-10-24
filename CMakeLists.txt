@@ -4,6 +4,12 @@ cmake_minimum_required(VERSION 3.10)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON) # Ensure C++17 is enforced
 
+# Release by default: without a build type, TensorStore and its codecs (fetched
+# below) compile without optimization, which made Zarr reads about 10x slower.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 include(FetchContent)
 include(CMakePrintHelpers)
 
