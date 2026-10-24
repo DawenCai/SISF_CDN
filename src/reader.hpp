@@ -1585,6 +1585,36 @@ struct region_chunk
     }
 };
 
+// One TensorStore context for all Zarr datasets. Its cache pool keeps decoded
+// chunks and shard indexes between requests (Context::Default() caches nothing).
+// Size from ZARR_CACHE_POOL_BYTES, default 1 GiB.
+inline tensorstore::Context zarr_context()
+{
+    static tensorstore::Context context = []()
+    {
+        int64_t bytes = 1LL << 30;
+        if (const char *env = std::getenv("ZARR_CACHE_POOL_BYTES"))
+        {
+            try
+            {
+                bytes = std::stoll(env);
+            }
+            catch (...)
+            {
+            }
+        }
+        auto ctx = tensorstore::Context::FromJson({{"cache_pool", {{"total_bytes_limit", bytes}}}});
+        if (!ctx.ok())
+        {
+            std::cerr << "Zarr context rejected (" << ctx.status() << "), using the default context" << std::endl;
+            return tensorstore::Context::Default();
+        }
+        std::cout << "Zarr cache pool: " << bytes << " bytes" << std::endl;
+        return *ctx;
+    }();
+    return context;
+}
+
 class archive_reader
 {
 public:
@@ -1703,21 +1733,27 @@ public:
         }
     }
 
+    // Opened once in load_metadata_zarr and reused by every request
+    tensorstore::TensorStore<> zarr_store;
+
     void load_metadata_zarr()
     {
-        tensorstore::Context context = tensorstore::Context::Default();
         auto store_future = tensorstore::Open({{"driver", "zarr3"},
                                                {"kvstore", {{"driver", "file"}, {"path", fname}}}},
-                                              context, tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
+                                              zarr_context(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
 
         auto store_result = store_future.result();
 
         if (!store_result.ok())
         {
-            std::cerr << "Error opening TensorStore: " << store_result.status() << std::endl;
+            // Skip this dataset; .value() on the error would abort the whole server
+            std::cerr << "Error opening TensorStore [" << fname << "]: " << store_result.status() << std::endl;
+            is_valid = false;
+            return;
         }
 
-        auto store = std::move(store_result.value());
+        zarr_store = std::move(store_result.value());
+        auto &store = zarr_store;
 
         auto domain = store.domain();
         auto shape = domain.shape();
@@ -2827,23 +2863,8 @@ public:
         }
         else if (type == ZARR)
         {
-            tensorstore::Context context = tensorstore::Context::Default();
-            auto store_future = tensorstore::Open({{"driver", "zarr3"},
-                                                   {"kvstore", {{"driver", "file"}, {"path", fname}}}},
-                                                  context, tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
-
-            auto store_result = store_future.result();
-
-            if (!store_result.ok())
             {
-                std::cerr << "Error opening TensorStore: " << store_result.status() << std::endl;
-            }
-            else
-            {
-                auto store = std::move(store_result.value());
-
-                const size_t read_buffer_size = osizex * osizey * osizez * sizeof(uint16_t) * channel_count;
-                uint16_t *read_buffer = (uint16_t *)malloc(read_buffer_size);
+                auto &store = zarr_store;
 
                 auto array_result = tensorstore::Read<tensorstore::zero_origin>(
                                         store | tensorstore::AllDims().SizedInterval(
