@@ -204,11 +204,12 @@ they were; `HEALTH_LOCK_MS` taken, or ignored with one log line; and, while
 a write is held inside the chunk cache lock, 503 `stuck lock_wait_ms=N
 write_held_ms=M` within `HEALTH_LOCK_MS` + 0.5 s with no request thread left
 waiting, then 200 again once the write goes through. Holding the write
-needs a build made with `-DNTRACER_TEST_HOOKS=ON` (a write then waits while
-`/data/.test_hold_write_lock` exists); on any other build that part is
-reported as SKIPPED, and `--require-hook` makes that a failure.
+needs a build made with `-DNTRACER_TEST_HOOKS=ON` (`docker build --build-arg
+TEST_HOOKS=ON`; a write then waits while `/data/.test_hold_write_lock`
+exists); on any other build that part is reported as SKIPPED, and
+`--require-hook` makes that a failure.
 
-`skip_unchanged.py --image IMAGE --work DIR [--rounds 40] [--require-hook]`
+`skip_unchanged.py --image IMAGE --work DIR [--rounds 40] [--require-hook] [--batch 0,64,3]`
 checks `SKIP_UNCHANGED_CHUNKS=1` on one image, without a baseline, against a
 server of the same image with the switch off: a PATCH of exactly what a layer
 holds appends nothing (off: every chunk covered whole is appended again); one
@@ -227,25 +228,28 @@ Without the hook those cases are SKIPPED, and `--require-hook` makes that a
 failure. `--batch 0,64,3` runs every case once per `WRITE_BATCH_CHUNKS`
 value, 0 (not batched) first, each pass on fresh data and its own servers,
 and then compares every stored file of the later passes with the first pass
-byte for byte (except the s19 run's, whose frame order depends on timing).
-In passes above 0 the `/performance` batch counters must move as the cases
-predict, the start-up line must show in both logs, and three hook cases run
-on the server with the skip switch off, on a 2x2x2-chunk box whose old
-voxels were read into the cache first: an entry write that fails for one
-chunk (`/data/.test_fail_entry_write` holding the chunk number), a `.meta`
-close that fails (`/data/.test_fail_meta_close`), and the mchunk's files
-replaced by copies while a batch waits after its file check
-(`/data/.test_hold_in_batch`). Each must answer 500, and every chunk must
-then read back as its files decode: the cache keeps no old voxels of a chunk
-whose entry reached the file, and the replaced files are left untouched. The
-first pass also checks the `WRITE_BATCH_CHUNKS` settings "0", "abc", "65"
+byte for byte (except the s19 run's, whose frame order depends on timing, and
+the hook cases' layers, written only in the later passes). In passes above 0
+the `/performance` batch counters must move as the cases predict, the
+start-up line must show in both logs, and four hook cases run on the server
+with the skip switch off, on a 2x2x2-chunk box whose old voxels were read
+into the cache first: an entry write that fails for one chunk
+(`/data/.test_fail_entry_write` holding the chunk number), a `.meta` close
+that fails (`/data/.test_fail_meta_close`), the mchunk's files replaced by
+another version of the layer while a batch waits after its file check
+(`/data/.test_hold_in_batch`; `/health` must report the held batch as a
+write), and an append that fails (`/data/.test_fail_append`). Each must
+answer 500, and every chunk must then read back as its files decode: the
+cache keeps no old voxels of a chunk whose entry reached the file, after a
+replacement every chunk of the layer reads the new files, which the write
+left untouched, and a failed append moves no entry. The first pass also
+checks the `WRITE_BATCH_CHUNKS` settings "0", "abc", "65"
 and "64". CI runs it with `--batch 0,64,3` after the harness, on the release
 build and on the sanitizer build, which has the hooks and adds
 `--require-hook`. `concurrent_patch.py` takes `--env KEY=VALUE` and
 `--resend-half` for the same s19 run on its own.
 
-`stress_d6.py` is not part of the harness; CI runs `--mode patch` once (300
-PATCHes) on the candidate after it. It stresses stale chunks in the
+`stress_d6.py` is not part of the harness; CI runs it after it (below). It stresses stale chunks in the
 chunk cache, which sit between two points inside the server and cannot be
 triggered on demand from outside. `--mode patch`: a read that decoded a
 chunk while a PATCH replaced it putting the old chunk back into the cache;
@@ -255,16 +259,24 @@ and after each PATCH the chunk is read again. `--box-edge 128` makes the box
 hooks, `WRITE_BATCH_CHUNKS` set) makes each batch wait 5 ms after its append
 and before its entries (`/data/.test_slow_batch`), while reads go on without
 reloading the unchanged `.meta`: a batch that bumped `data_gen` before its
-entries then lets reads put old chunks back. `--mode rename`: s15's
+entries then lets reads put old chunks back. `--fail-meta-close` (the same
+build and setting) makes every batch's `.meta` close fail
+(`/data/.test_fail_meta_close`): every PATCH must answer 500, and every chunk
+read after it must still be the new one, since its entries reached the file
+and the batch must still bump `data_gen`. `--mode rename`: s15's
 sequence, repeated, reporting how many cycles landed. `--mode
 rename-write`: the files replaced at a later point in each cycle of a long
 PATCH, then every voxel checked; a PATCH that answered 500 must have left the
-new files untouched. `--env KEY=VALUE` starts the server with that variable;
-with `WRITE_BATCH_CHUNKS` set, `/performance` must show the batch counters,
-and without it must not. CI also runs `--mode patch --box-edge 128` (with
-`--slow-batch` on the sanitizer build, which has the hooks) and `--mode
-rename-write --cycles 12 --sweep 0.6`, both with `WRITE_BATCH_CHUNKS=64`. A
-run that finds no stale read means
+new files untouched. `--sweep auto` times one PATCH first and spreads the
+renames over that time; `--require-mid-write` fails the run when no rename
+landed during a PATCH's write-back. `--env KEY=VALUE` starts the server with
+that variable; with `WRITE_BATCH_CHUNKS` set, `/performance` must show the
+batch counters, and without it must not. CI runs `--mode patch` (300
+PATCHes of one chunk), then with `WRITE_BATCH_CHUNKS=64`: `--mode patch
+--box-edge 128` (with `--slow-batch` on the sanitizer build, which has the
+hooks), `--mode patch --box-edge 128 --fail-meta-close` (sanitizer build
+only), and `--mode rename-write --cycles 12 --sweep auto
+--require-mid-write`. A run that finds no stale read means
 something only if the same settings find some on a build without the fix.
 
 Compare like with like: run both images on amd64. An integer division by zero

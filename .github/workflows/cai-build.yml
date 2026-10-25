@@ -83,16 +83,19 @@ jobs:
       # store the same bytes and give the same answers, so the allow file is
       # the same. 64 is one 128^3 box; 5 splits the harness's larger requests
       # into several batches with a short last one. The start-up line shows
-      # the server took the setting.
+      # the server took the setting. Both runs go ahead when one fails.
       - name: Regression harness with batched chunk writes (WRITE_BATCH_CHUNKS=64 and 5)
         if: ${{ !cancelled() }}
+        timeout-minutes: 30
         working-directory: tests/regress
         run: |
+          rc=0
           for n in 64 5; do
             python harness.py --baseline "$BASELINE" --candidate sisf_cdn:candidate --candidate-env WRITE_BATCH_CHUNKS=$n \
-              --work "$RUNNER_TEMP/regress-b$n" --allow expected_diffs.json --report "$RUNNER_TEMP/report-b$n.json"
-            grep -n "(WRITE_BATCH_CHUNKS=$n)" "$RUNNER_TEMP/regress-b$n/candidate.log"
+              --work "$RUNNER_TEMP/regress-b$n" --allow expected_diffs.json --report "$RUNNER_TEMP/report-b$n.json" || rc=1
+            grep -n "(WRITE_BATCH_CHUNKS=$n)" "$RUNNER_TEMP/regress-b$n/candidate.log" || rc=1
           done
+          exit $rc
 
       # The harness sends its PATCHes one at a time, so it passes a write that
       # lets a read racing it put the old chunk back into the chunk cache (a
@@ -110,22 +113,41 @@ jobs:
 
       # With WRITE_BATCH_CHUNKS one hold of the lock writes a whole batch and
       # bumps data_gen once, so the same race over a 128^3 box (64 chunks, one
-      # batch per PATCH), every chunk checked; on the sanitizer build, which
+      # batch per PATCH), every chunk checked. On the sanitizer build, which
       # has the test hooks, each batch also waits after its append
-      # (--slow-batch), so a data_gen bump placed before the entries shows;
-      # then files replaced by rename while a long batched PATCH writes (a
-      # short sweep, since batched PATCHes are quick), where a PATCH that
-      # answers 500 must leave the new files untouched.
+      # (--slow-batch), so a data_gen bump placed before the entries shows.
       - name: D6 stress with batched chunk writes (WRITE_BATCH_CHUNKS=64)
         if: ${{ !cancelled() }}
-        timeout-minutes: 15
+        timeout-minutes: 10
         working-directory: tests/regress
         run: |
           python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6_b64" \
             --mode patch --writes 300 --readers 8 --box-edge 128 --env WRITE_BATCH_CHUNKS=64 \
             ${{ matrix.sanitize == 'ON' && '--slow-batch' || '' }}
+
+      # The same race when every batch's .meta close fails (a hook): every
+      # PATCH answers 500, but its entries reached the file, so data_gen must
+      # still be bumped and every chunk read after it must be the new one.
+      # Sanitizer build only (it has the hooks).
+      - name: D6 stress, every batch's .meta close failing (WRITE_BATCH_CHUNKS=64)
+        if: ${{ !cancelled() && matrix.sanitize == 'ON' }}
+        timeout-minutes: 10
+        working-directory: tests/regress
+        run: |
+          python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6_closefail_b64" \
+            --mode patch --writes 300 --readers 8 --box-edge 128 --env WRITE_BATCH_CHUNKS=64 --fail-meta-close
+
+      # The files replaced by rename while a long batched PATCH writes, the
+      # renames spread over the time one PATCH takes on this runner (measured
+      # first), where a PATCH that answers 500 must leave the new files
+      # untouched, and at least one rename must land during the write-back.
+      - name: D6 stress, files replaced during batched writes (WRITE_BATCH_CHUNKS=64)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        working-directory: tests/regress
+        run: |
           python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6_rw_b64" \
-            --mode rename-write --cycles 12 --sweep 0.6 --env WRITE_BATCH_CHUNKS=64
+            --mode rename-write --cycles 12 --sweep auto --require-mid-write --env WRITE_BATCH_CHUNKS=64
 
       # SKIP_UNCHANGED_CHUNKS is off in the harness above, and none of its
       # requests resends a whole chunk unchanged, so it never reaches the skip
@@ -159,8 +181,21 @@ jobs:
           else
             echo "no AddressSanitizer reports in $(ls regress*/candidate*.log | wc -l) candidate logs"
           fi
-          echo "UBSan runtime errors by site:"
-          grep -h "runtime error:" regress*/candidate*.log | sed -E 's/^[^ ]*\/src\///; s/value [0-9]+/value N/' | sort | uniq -c | sort -rn | head -20 || true
+          echo "UBSan runtime errors by site (harness and stress runs; skip_unchanged lists its own):"
+          shopt -s nullglob
+          grep -h "runtime error:" regress*/candidate*.log stress_d6*/server.log | sed -E 's/^[^ ]*\/src\///; s/value [0-9]+/value N/' | sort | uniq -c | sort -rn | head -20 || true
+
+      # The test hooks are compiled only into the sanitizer build; the release
+      # build, the one published, must carry none of them.
+      - name: No test hooks in the release build
+        if: ${{ !cancelled() && matrix.sanitize == 'OFF' }}
+        run: |
+          if docker run --rm --pull never --entrypoint grep sisf_cdn:candidate -c -a "TEST HOOK" /app/nTracer_cdn; then
+            echo "the release build has test hooks (count above)"
+            exit 1
+          else
+            echo "no test hooks in the release build"
+          fi
 
       - name: Keep the reports
         if: always()
