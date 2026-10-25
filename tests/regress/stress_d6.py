@@ -22,7 +22,12 @@ hooks and WRITE_BATCH_CHUNKS set) each batch waits 5 ms after its append and
 before its entries, while the .meta is unchanged and reads go on without
 reloading it: a batch that bumped data_gen before writing its entries lets a
 read in that wait take the new data_gen with the old entries and put the old
-chunks back, which a run without the wait almost never shows.
+chunks back, which a run without the wait almost never shows. With
+--fail-meta-close (the same build and setting) every batch's .meta close
+fails: every PATCH must answer 500 "Could not write chunk", and since its
+entries reached the file every chunk read after it must still show its
+version (the batch must bump data_gen all the same); the server's log must
+show the hook and the failed close.
 
 --mode rename: a request keeps an mchunk's .meta and .data open while it
 reads the mchunk's chunks, and a descriptor stays on the file it opened when
@@ -51,6 +56,11 @@ PATCH that the replacement interrupted may answer 500, and must then have left
 the new files exactly as they were renamed in: the staged files are hashed
 before the PATCH starts (the rename moves those same files in, so nothing the
 PATCH does can reach them earlier) and the live files again once it answered.
+With --sweep auto one PATCH of the box is timed first, with no rename (the
+live version is then put back), and the renames come from 0.1 to 0.9 of that
+time. A PATCH that answered 500 "Could not write chunk" had the rename land
+during its write-back; with --require-mid-write a run with none fails, since
+it tested nothing there.
 
 The copies and renames run inside the server's container: a file shared into
 a container from the host can be read with its old contents for a moment
@@ -59,17 +69,19 @@ modes look for.
 
 In every mode, before the container is removed, /performance must show the
 batched chunk writes line when --env sets WRITE_BATCH_CHUNKS to anything but
-0 (with batches counted, and in patch mode chunks written in them) and must
-not show it otherwise, and the server's log, saved as server.log in the work
-folder, must have no AddressSanitizer report.
+0 (with batches counted, and in patch mode chunks in them) and must not show
+it otherwise, and the server's log, saved as server.log in the work folder,
+must have no AddressSanitizer report.
 
     python stress_d6.py --image IMAGE --work DIR [--platform linux/arm64]
                         [--mode patch] [--writes 300] [--readers 8]
                         [--box-edge 32] [--env KEY=VALUE ...] [--slow-batch]
+                        [--fail-meta-close]
     python stress_d6.py --image IMAGE --work DIR --mode rename [--cycles 20]
                         [--chunk 8] [--delay 0.05]
     python stress_d6.py --image IMAGE --work DIR --mode rename-write
-                        [--cycles 12] [--delay 0.05] [--sweep 5.5]
+                        [--cycles 12] [--delay 0.05] [--sweep 5.5 | --sweep auto]
+                        [--require-mid-write]
 
 --env starts the server with that environment variable (repeatable, any
 mode). Exit status 1 if any stale read was seen or a check above failed. A
@@ -103,9 +115,17 @@ MCHUNK_NAME = "chunk_0_0_0.0.1X"
 # Logged once by a build with the test hooks when --slow-batch slows its batches
 SLOW_BATCH_LINE = "TEST HOOK: batches wait 5 ms after their append"
 
+# With --fail-meta-close: what every PATCH must answer, what the hook logs for
+# each failed close, and the line the server logs for it (which also holds
+# CLOSE_FAILED_NOTE)
+CLOSE_FAIL_ANSWER = b"500 Internal Server Error -- Could not write chunk\n"
+CLOSE_FAIL_HOOK_LINE = "TEST HOOK: .meta close failed on purpose"
+CLOSE_FAILED_LINE = "Metadata entry write failed: "
+CLOSE_FAILED_NOTE = "(closing the file)"
+
 # What /performance shows while WRITE_BATCH_CHUNKS is on (the hold is in ms)
 BATCH_LINE = re.compile(r"<p>Batched chunk writes \(up to (\d+) chunks per batch\): batches (\d+); "
-                        r"chunks written in them (\d+); longest hold of the chunk cache lock (\d+(?:\.\d+)?) ms</p>")
+                        r"chunks in them (\d+); longest hold of the chunk cache lock (\d+(?:\.\d+)?) ms</p>")
 
 
 def box(edge):
@@ -196,7 +216,7 @@ def check_server(name, port, work, env, need_chunks):
     """Run before the container is removed. /performance must show the
     batched chunk writes line if env turns WRITE_BATCH_CHUNKS on (anything but
     unset, empty or 0, so a value the server ignores fails here), with batches
-    counted and, if need_chunks, chunks written in them, and must not show it
+    counted and, if need_chunks, chunks in them, and must not show it
     otherwise. The server's log is saved to work/server.log and must have no
     AddressSanitizer report. Returns (lines to print, number of problems)."""
     lines, problems = [], 0
@@ -225,7 +245,7 @@ def check_server(name, port, work, env, need_chunks):
         problems += 1
     else:
         up_to, batches, chunks = (int(m.group(i)) for i in (1, 2, 3))
-        seen = f"up to {up_to}, {batches} batches, {chunks} chunks written in them, longest hold {m.group(4)} ms"
+        seen = f"up to {up_to}, {batches} batches, {chunks} chunks in them, longest hold {m.group(4)} ms"
         if value.isdigit() and up_to != int(value):
             lines.append(f"  PROBLEM /performance batched chunk writes line says {seen}, with {setting}")
             problems += 1
@@ -254,10 +274,13 @@ def run_patch(args, work, env):
     fixtures.segmentation(os.path.join(work, DS), (2 * e, 2 * e, e), (2 * e, 2 * e, e), RES)
     name, port = start_server(args, work, env)
     stale, procs, checks, failed = [], [], [], 0
+    sent, wrong = 0, None
     stop, count, errors = mp.Event(), mp.Value("q", 0), mp.Queue()
     try:
         if args.slow_batch:
             in_container(name, "touch /data/.test_slow_batch")
+        if args.fail_meta_close:
+            in_container(name, "touch /data/.test_fail_meta_close")
         procs = [mp.Process(target=reader, args=(port, path, stop, count, errors)) for _ in range(args.readers)]
         for p in procs:
             p.start()
@@ -269,8 +292,14 @@ def run_patch(args, work, env):
             v = (n % 60000) + 1
             wconn.request("PATCH", f"/{DS}+token={fixtures.TOKEN}/write/1/{box(e)}", contents(v, e).tobytes())
             r = wconn.getresponse()
-            r.read()
-            if r.status != 200:
+            answered = r.read()
+            sent = n + 1
+            if args.fail_meta_close:
+                # A 500 here still wrote its entries, so the reads below check it
+                if r.status != 500 or answered != CLOSE_FAIL_ANSWER:
+                    wrong = (n, r.status, answered)
+                    break
+            elif r.status != 200:
                 raise RuntimeError(f"PATCH {n} answered {r.status}")
             time.sleep(args.settle)
             got = [get_versions(cconn, e), get_versions(cconn, e)]
@@ -295,12 +324,34 @@ def run_patch(args, work, env):
             checks.append(f"  PROBLEM --slow-batch: the server's log has no '{SLOW_BATCH_LINE}' line "
                           f"(a build without the test hooks, or no batch ran)")
             failed += 1
+    if args.fail_meta_close:
+        if wrong is None:
+            checks.append(f"  OK every PATCH answered {CLOSE_FAIL_ANSWER!r} (--fail-meta-close)")
+        else:
+            checks.append(f"  PROBLEM --fail-meta-close: PATCH {wrong[0]} answered {wrong[1]} {wrong[2][:80]!r}, not 500 "
+                          f"{CLOSE_FAIL_ANSWER!r} (the run stopped there)")
+            failed += 1
+        # Without the hook the run tested nothing failing
+        with open(os.path.join(work, "server.log"), errors="replace") as f:
+            log = f.read().splitlines()
+        if any(CLOSE_FAIL_HOOK_LINE in line for line in log):
+            checks.append("  OK the batches' .meta close failed on purpose (--fail-meta-close)")
+        else:
+            checks.append(f"  PROBLEM --fail-meta-close: the server's log has no '{CLOSE_FAIL_HOOK_LINE}' line "
+                          f"(a build without the test hooks, or no batch ran)")
+            failed += 1
+        if any(CLOSE_FAILED_LINE in line and CLOSE_FAILED_NOTE in line for line in log):
+            checks.append(f"  OK the server logged the failed close ('{CLOSE_FAILED_LINE}... {CLOSE_FAILED_NOTE}')")
+        else:
+            checks.append(f"  PROBLEM --fail-meta-close: the server's log has no '{CLOSE_FAILED_LINE}' line "
+                          f"with '{CLOSE_FAILED_NOTE}'")
+            failed += 1
 
     errs = []
     while not errors.empty():
         errs.append(errors.get())
     stale_chunks = sum(g != v for _, v, got in stale for read in got for g in read)
-    print(f"image {args.image}, env {env or 'none'}: {args.writes} PATCHes of box {box(e)} in {elapsed:.1f} s, "
+    print(f"image {args.image}, env {env or 'none'}: {sent} PATCHes of box {box(e)} in {elapsed:.1f} s, "
           f"{count.value} concurrent reads from {args.readers} processes, {len(stale)} PATCHes followed by a "
           f"stale read, {stale_chunks} stale chunk reads")
     for n, v, got in stale[:10]:
@@ -465,12 +516,29 @@ def run_rename_write(args, work, env):
         st, _ = request(port, "GET", f"/{RENAME_DS}/1/0-1_0-1_0-1")  # builds the reader
         if st != 200:
             raise RuntimeError(f"first read answered {st}")
+        start, sweep = args.delay, args.sweep
+        if args.sweep == "auto":
+            # How long one PATCH takes here, with nothing renamed
+            t0 = time.time()
+            st, _ = request(port, "PATCH", patch_path, body)
+            took = time.time() - t0
+            if st != 200:
+                raise RuntimeError(f"timing PATCH answered {st}")
+            # Version 0 back in place, and its header read, as the cycles start
+            stage_version(name, 0)
+            replace_live(name, live)
+            st, _ = request(port, "GET", f"/{RENAME_DS}/1/0-1_0-1_0-1")
+            if st != 200:
+                raise RuntimeError(f"read after the timing PATCH answered {st}")
+            start, sweep = 0.1 * took, 0.8 * took
+            print("--sweep auto: one PATCH of box {}-{}_{}-{}_{}-{}".format(*b) + f" took {took:.3f} s with no rename; "
+                  f"delay {start:.3f} s, sweep {sweep:.3f} s")
         for k in range(args.cycles):
             new = versions[(k + 1) % 3]
             stage_version(name, (k + 1) % 3)
             # The files the rename moves in, before anything can write to them
             staged = hashes_in_container(name, ["/data/stage/next.data", "/data/stage/next.meta"])
-            delay = args.delay + args.sweep * k / max(1, args.cycles - 1)
+            delay = start + sweep * k / max(1, args.cycles - 1)
             res = {}
 
             def patch():
@@ -514,11 +582,28 @@ def run_rename_write(args, work, env):
           f"the rename before the PATCH answered ({sum(r['patch'] == 500 for r in rows)} PATCHes answered 500, "
           f"{len(in_write)} of them 'Could not write chunk'); {len(stale)} cycles with old voxels written into the "
           f"new files, {len(touched)} with a PATCH that answered 500 and changed them")
+    if args.require_mid_write:
+        if in_write:
+            checks.append(f"  OK {len(in_write)} cycles had the rename land during the write-back (--require-mid-write)")
+        else:
+            checks.append("  PROBLEM --require-mid-write: no PATCH answered 500 'Could not write chunk', so no rename "
+                          "landed during a write-back and the run tested nothing there")
+            failed += 1
     for r in rows:
         print(f"  {r}")
     for line in checks:
         print(line)
     return 1 if stale or touched or failed else 0
+
+
+def sweep_arg(text):
+    """--sweep: seconds, or auto (rename-write mode times one PATCH first)."""
+    if text == "auto":
+        return text
+    try:
+        return float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"takes seconds or auto, not {text!r}") from None
 
 
 def main():
@@ -535,8 +620,12 @@ def main():
     ap.add_argument("--cycles", type=int, default=20, help="rename mode: replacements")
     ap.add_argument("--chunk", type=int, default=8, help="rename mode: chunk edge; small chunks make the long read long")
     ap.add_argument("--delay", type=float, default=0.05, help="rename mode: from the long read's start to the rename, in s")
-    ap.add_argument("--sweep", type=float, default=2.0,
-                    help="rename-write mode: the rename comes delay + sweep * k / (cycles - 1) s after the PATCH starts")
+    ap.add_argument("--sweep", type=sweep_arg, default=2.0,
+                    help="rename-write mode: the rename comes delay + sweep * k / (cycles - 1) s after the PATCH starts; "
+                         "auto times one PATCH first and sets delay and sweep to 0.1 and 0.8 times that")
+    ap.add_argument("--require-mid-write", action="store_true",
+                    help="rename-write mode: fail if no rename landed during a PATCH's write-back (no PATCH answered "
+                         "500 'Could not write chunk')")
     ap.add_argument("--margin", type=float, default=0.2,
                     help="rename mode: how long the long read must go on after the reload for the cycle to count as landed, in s")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
@@ -544,6 +633,9 @@ def main():
     ap.add_argument("--slow-batch", action="store_true",
                     help="patch mode with WRITE_BATCH_CHUNKS: each batch waits 5 ms after its append, before its "
                          "entries (needs a build with the test hooks)")
+    ap.add_argument("--fail-meta-close", action="store_true",
+                    help="patch mode with WRITE_BATCH_CHUNKS: every batch's .meta close fails, so every PATCH must "
+                         "answer 500 and every chunk read after it must still be new (needs a build with the test hooks)")
     args = ap.parse_args()
     env = {}
     for kv in args.env:
@@ -561,8 +653,13 @@ def main():
         if (e // 32) ** 3 >= lines:
             ap.error(f"--box-edge {e} covers {(e // 32) ** 3} chunks; "
                      f"it must be fewer than the chunk cache's {lines} lines")
-    if args.slow_batch and (args.mode != "patch" or re.fullmatch(r"[0-9]*[1-9][0-9]*", env.get("WRITE_BATCH_CHUNKS", "")) is None):
+    batched = args.mode == "patch" and re.fullmatch(r"[0-9]*[1-9][0-9]*", env.get("WRITE_BATCH_CHUNKS", "")) is not None
+    if args.slow_batch and not batched:
         ap.error("--slow-batch is for --mode patch with WRITE_BATCH_CHUNKS above 0")
+    if args.fail_meta_close and not batched:
+        ap.error("--fail-meta-close is for --mode patch with WRITE_BATCH_CHUNKS above 0")
+    if (args.sweep == "auto" or args.require_mid_write) and args.mode != "rename-write":
+        ap.error("--sweep auto and --require-mid-write are for --mode rename-write")
 
     work = os.path.abspath(args.work)
     shutil.rmtree(work, ignore_errors=True)
