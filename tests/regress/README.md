@@ -174,6 +174,17 @@ baseline first. A missing image fails the run instead of being fetched.
     `/info` (`viewer_overreach`, the viewer's prefetch arithmetic): none may
     wrap, and the empty boxes must answer 200 with no body; and PATCHes of
     the last plane of each axis of levels 2, 4 and 8 of the layer, read back.
+  - s25: a descriptor dataset (only a `descriptor.json`) with one layer, all
+    of an untiled 40 x 30 x 20 image placed at target offset (-2, -4, -6).
+    The descriptor's origin is the smallest offset on each axis (0 where
+    none is negative), so the layer starts at 0 on every axis and the
+    descriptor must read as its source. The CDN used to take the layer's z
+    start from the y origin, so the layer stopped two planes short and the
+    last two planes read as zeros. Records: the source's own full read
+    against the fixture (the control, alike on both servers), the
+    descriptor's `/info`, and its full read and its last plane against the
+    fixture, each as the number of voxels that differ and the planes that
+    read as all zeros.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
