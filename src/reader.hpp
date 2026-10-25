@@ -1572,9 +1572,9 @@ public:
 
                 auto reader = parent_archive_inventory->find(l->source_name);
 
-                if (reader == parent_archive_inventory->end())
+                if (reader == parent_archive_inventory->end() || reader->second == nullptr || !reader->second->is_valid)
                 {
-                    // Source not in inventory
+                    // Source not in inventory, or it failed to open
                     continue;
                 }
 
