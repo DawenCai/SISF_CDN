@@ -265,6 +265,19 @@ bool test_fail_entry_write(const std::string &meta_fname, size_t id)
     return true;
 }
 
+// Test-only, as above: while <data path>/.test_fail_append exists, a batch
+// writes no frame and counts its append as failed (it then returns, with no
+// entry written).
+bool test_fail_append(const std::string &data_fname)
+{
+    if (access((DATA_PATH + ".test_fail_append").c_str(), F_OK) != 0)
+    {
+        return false;
+    }
+    std::cerr << "TEST HOOK: append failed on purpose: " << data_fname << std::endl;
+    return true;
+}
+
 // Test-only, as above: while <data path>/.test_slow_batch exists, a batch waits
 // 5 ms holding the chunk cache lock after its append, before it writes any
 // entry. The .meta is not yet changed then, so reads go on without reloading
@@ -304,13 +317,30 @@ bool test_fail_meta_close(const std::string &meta_fname)
 std::atomic<uint64_t> skip_chunks_covered{0};
 std::atomic<uint64_t> skip_chunks_skipped{0};
 
-// With WRITE_BATCH_CHUNKS above 0 (app.cpp): batches written (each one hold of
-// the chunk cache lock for up to that many chunks of one mchunk), the chunks
-// they wrote, and the longest a batch held the lock, in ns. Shown on
-// /performance only while the switch is on.
+// With WRITE_BATCH_CHUNKS above 0 (app.cpp): batches that appended their frames
+// (each one hold of the chunk cache lock for up to that many chunks of one
+// mchunk), the chunks in them (written as requested or not), and the longest
+// any batch held the lock, in ns, a batch that failed before appending
+// included. Shown on /performance only while the switch is on.
 std::atomic<uint64_t> batch_writes{0};
 std::atomic<uint64_t> batch_chunks_written{0};
 std::atomic<int64_t> batch_hold_max_ns{0};
+
+// Records how long a batch held the chunk cache lock in batch_hold_max_ns when
+// it goes out of scope. Declared after the lock_guard, so it runs on every
+// return before the lock is released.
+struct batch_hold_recorder
+{
+    const int64_t since = steady_now_ns();
+    ~batch_hold_recorder()
+    {
+        const int64_t held = steady_now_ns() - since;
+        int64_t longest = batch_hold_max_ns.load();
+        while (held > longest && !batch_hold_max_ns.compare_exchange_weak(longest, held))
+        {
+        }
+    }
+};
 
 size_t global_cache_size = chunk_cache_lines_from_env();
 global_chunk_line *global_chunk_cache = (global_chunk_line *)calloc(global_cache_size, sizeof(global_chunk_line));
@@ -1601,7 +1631,7 @@ public:
             // Released on every return and if anything below throws
             std::lock_guard<std::timed_mutex> lock(global_chunk_cache_mutex);
             chunk_write_lock_timer lock_timer;
-            const int64_t held_from = steady_now_ns();
+            batch_hold_recorder hold_recorder;
 #ifdef NTRACER_TEST_HOOKS
             test_hold_write_lock();
 #endif
@@ -1646,7 +1676,15 @@ public:
 
             // Never point an entry at bytes that did not reach the file
             const off_t base = lseek(data_file.fd, 0, SEEK_END);
-            if (base < 0 || !pwrite_all(data_file.fd, frames, used, (uint64_t)base) || !data_file.close())
+            bool appended = base >= 0;
+#ifdef NTRACER_TEST_HOOKS
+            if (appended && test_fail_append(data_fname))
+            {
+                appended = false;
+            }
+#endif
+            appended = appended && pwrite_all(data_file.fd, frames, used, (uint64_t)base) && data_file.close();
+            if (!appended)
             {
                 std::string note;
                 if (log_limit_append.allow(note))
@@ -1710,7 +1748,8 @@ public:
                 std::string note;
                 if (log_limit_entry_write.allow(note))
                 {
-                    std::cerr << "Metadata entry write failed (closing the file): " << meta_fname << which << note << std::endl;
+                    std::cerr << "Metadata entry write failed: " << meta_fname << which << " (closing the file)" << note
+                              << std::endl;
                 }
             }
 
@@ -1746,11 +1785,6 @@ public:
 
             batch_writes.fetch_add(1);
             batch_chunks_written.fetch_add(batch.size());
-            const int64_t held = steady_now_ns() - held_from;
-            int64_t longest = batch_hold_max_ns.load();
-            while (held > longest && !batch_hold_max_ns.compare_exchange_weak(longest, held))
-            {
-            }
         }
 
         free(frames);

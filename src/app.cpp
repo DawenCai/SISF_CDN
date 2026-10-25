@@ -121,7 +121,8 @@ bool SKIP_UNCHANGED_CHUNKS = false;
 // WRITE_BATCH_CHUNKS=N, from 1 to 64: a write writes up to N consecutive chunks
 // of one mchunk holding the chunk cache lock once (see replace_region and
 // overwrite_chunks). 0 or unset is off: writes, /performance and the log are as
-// before. 64 is one 128^3 box of 32^3 chunks.
+// before. 64, one 128^3 box of 32^3 chunks, is the most the code takes, not a
+// value measured for a site: a batch of dense chunks holds the lock longer.
 size_t WRITE_BATCH_CHUNKS = 0;
 const size_t WRITE_BATCH_CHUNKS_MAX = 64;
 
@@ -512,7 +513,7 @@ int main(int argc, char *argv[])
 		if (WRITE_BATCH_CHUNKS > 0)
 		{
 			out << "<p>Batched chunk writes (up to " << WRITE_BATCH_CHUNKS << " chunks per batch): batches "
-				<< batch_writes.load() << "; chunks written in them " << batch_chunks_written.load()
+				<< batch_writes.load() << "; chunks in them " << batch_chunks_written.load()
 				<< "; longest hold of the chunk cache lock " << (batch_hold_max_ns.load() / 1000) / 1000.0 << " ms</p>\n";
 		}
 		out << "</body>\n";
