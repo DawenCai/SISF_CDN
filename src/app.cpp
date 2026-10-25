@@ -118,6 +118,13 @@ log_limiter log_limit_skeleton_write;
 // writes, /performance and the log are as before.
 bool SKIP_UNCHANGED_CHUNKS = false;
 
+// WRITE_BATCH_CHUNKS=N, from 1 to 64: a write writes up to N consecutive chunks
+// of one mchunk holding the chunk cache lock once (see replace_region and
+// overwrite_chunks). 0 or unset is off: writes, /performance and the log are as
+// before. 64 is one 128^3 box of 32^3 chunks.
+size_t WRITE_BATCH_CHUNKS = 0;
+const size_t WRITE_BATCH_CHUNKS_MAX = 64;
+
 crow::response skeleton_write_refused(const std::string &route, const std::string &data_id)
 {
 	std::string note;
@@ -345,6 +352,27 @@ int main(int argc, char *argv[])
 		std::cerr << "SKIP_UNCHANGED_CHUNKS ignored (not 0 or 1): " << skip_unchanged << std::endl;
 	}
 
+	std::string write_batch_chunks = read_env_variable("WRITE_BATCH_CHUNKS");
+	if (write_batch_chunks.size() > 0)
+	{
+		size_t n = 0;
+		if (parse_decimal(write_batch_chunks, n) && n <= WRITE_BATCH_CHUNKS_MAX)
+		{
+			WRITE_BATCH_CHUNKS = n;
+		}
+		else
+		{
+			std::cerr << "WRITE_BATCH_CHUNKS ignored (not a whole number from 0 to " << WRITE_BATCH_CHUNKS_MAX
+					  << "): " << write_batch_chunks << "; writes are not batched" << std::endl;
+		}
+	}
+	if (WRITE_BATCH_CHUNKS > 0)
+	{
+		std::cout << "Chunk writes: up to " << WRITE_BATCH_CHUNKS
+				  << " chunks of one mchunk per hold of the chunk cache lock (WRITE_BATCH_CHUNKS=" << WRITE_BATCH_CHUNKS << ")"
+				  << std::endl;
+	}
+
 	std::string max_read_voxels = read_env_variable("MAX_READ_VOXELS");
 	if (max_read_voxels.size() > 0 && !parse_decimal(max_read_voxels, MAX_READ_VOXELS))
 	{
@@ -480,6 +508,12 @@ int main(int argc, char *argv[])
 		{
 			out << "<p>Chunks covered whole by writes: " << skip_chunks_covered.load()
 				<< "; left as stored because unchanged: " << skip_chunks_skipped.load() << "</p>\n";
+		}
+		if (WRITE_BATCH_CHUNKS > 0)
+		{
+			out << "<p>Batched chunk writes (up to " << WRITE_BATCH_CHUNKS << " chunks per batch): batches "
+				<< batch_writes.load() << "; chunks written in them " << batch_chunks_written.load()
+				<< "; longest hold of the chunk cache lock " << (batch_hold_max_ns.load() / 1000) / 1000.0 << " ms</p>\n";
 		}
 		out << "</body>\n";
 		out << "</html>";
@@ -1036,7 +1070,8 @@ int main(int argc, char *argv[])
 
 		std::string write_error;
 		if (!reader->replace_region(
-			scale, x_begin, x_end, y_begin, y_end, z_begin, z_end, insert.c_str(), write_error, SKIP_UNCHANGED_CHUNKS
+			scale, x_begin, x_end, y_begin, y_end, z_begin, z_end, insert.c_str(), write_error, SKIP_UNCHANGED_CHUNKS,
+			WRITE_BATCH_CHUNKS
 		))
 		{
 			res.code = crow::status::INTERNAL_SERVER_ERROR;

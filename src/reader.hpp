@@ -223,6 +223,59 @@ void test_hold_before_skip_check()
     }
     std::cerr << "TEST HOOK: skip check released" << std::endl;
 }
+
+// Test-only, as above, for batched writes (WRITE_BATCH_CHUNKS): while
+// <data path>/.test_hold_in_batch exists, a batch waits here holding the chunk
+// cache lock, after it opened its files and checked them and before it
+// appends. tests/regress/skip_unchanged.py replaces the files by rename in
+// between.
+void test_hold_in_batch()
+{
+    const std::string marker = DATA_PATH + ".test_hold_in_batch";
+    if (access(marker.c_str(), F_OK) != 0)
+    {
+        return;
+    }
+    std::cerr << "TEST HOOK: batch held after its file check while " << marker << " exists" << std::endl;
+    while (access(marker.c_str(), F_OK) == 0)
+    {
+        usleep(50 * 1000);
+    }
+    std::cerr << "TEST HOOK: batch released" << std::endl;
+}
+
+// Test-only, as above: while <data path>/.test_fail_entry_write exists and
+// holds a chunk number, a batch that writes that chunk of meta_fname does not
+// write its entry and counts the entry write as failed.
+bool test_fail_entry_write(const std::string &meta_fname, size_t id)
+{
+    std::ifstream marker(DATA_PATH + ".test_fail_entry_write");
+    if (!marker)
+    {
+        return false;
+    }
+    std::string text;
+    marker >> text;
+    size_t wanted = 0;
+    if (!parse_decimal(text, wanted) || wanted != id)
+    {
+        return false;
+    }
+    std::cerr << "TEST HOOK: entry write failed on purpose: " << meta_fname << " chunk " << id << std::endl;
+    return true;
+}
+
+// Test-only, as above: while <data path>/.test_fail_meta_close exists, a batch
+// closes .meta and then counts the close as failed.
+bool test_fail_meta_close(const std::string &meta_fname)
+{
+    if (access((DATA_PATH + ".test_fail_meta_close").c_str(), F_OK) != 0)
+    {
+        return false;
+    }
+    std::cerr << "TEST HOOK: .meta close failed on purpose: " << meta_fname << std::endl;
+    return true;
+}
 #endif
 
 // With SKIP_UNCHANGED_CHUNKS=1 (app.cpp): chunks that writes covered whole, and
@@ -230,6 +283,14 @@ void test_hold_before_skip_check()
 // them. Shown on /performance only while the switch is on.
 std::atomic<uint64_t> skip_chunks_covered{0};
 std::atomic<uint64_t> skip_chunks_skipped{0};
+
+// With WRITE_BATCH_CHUNKS above 0 (app.cpp): batches written (each one hold of
+// the chunk cache lock for up to that many chunks of one mchunk), the chunks
+// they wrote, and the longest a batch held the lock, in ns. Shown on
+// /performance only while the switch is on.
+std::atomic<uint64_t> batch_writes{0};
+std::atomic<uint64_t> batch_chunks_written{0};
+std::atomic<int64_t> batch_hold_max_ns{0};
 
 size_t global_cache_size = chunk_cache_lines_from_env();
 global_chunk_line *global_chunk_cache = (global_chunk_line *)calloc(global_cache_size, sizeof(global_chunk_line));
@@ -1445,6 +1506,232 @@ public:
 
         free(compressed_data);
         return entry_written && files_kept;
+    }
+
+    // A chunk of a batched write: its number in this mchunk and its voxels
+    struct batch_chunk
+    {
+        size_t id;
+        uint16_t *data;
+        size_t data_size;
+    };
+
+    // Writes the chunks of batch (all of this mchunk, each once) holding the
+    // chunk cache lock once, for WRITE_BATCH_CHUNKS. Returns false if any of
+    // them may not be on disk as requested; expected is as for
+    // overwrite_chunk.
+    //
+    // The same steps as overwrite_chunk, taken once for the batch: both files
+    // are opened and checked through their descriptors (files replaced since
+    // refuse the whole batch, nothing written); every frame is appended in one
+    // write and .data closed before any entry is written, so no entry points at
+    // bytes that did not reach the file (a failed append returns at once, with
+    // no entry written); then each chunk's entry is written and .meta closed
+    // once. Whatever the entry writes and that close return, the files are then
+    // checked, the .meta's time taken as this write's if they are the ones
+    // expected, data_gen bumped once and every chunk's cache line dropped,
+    // before the lock is released, as overwrite_chunk does after a failed entry
+    // write: a chunk whose entry did reach the file must not be served from a
+    // line of its old voxels.
+    bool overwrite_chunks(const std::vector<batch_chunk> &batch, const mchunk_file_ids &expected)
+    {
+        if (batch.empty())
+        {
+            return true;
+        }
+        const std::string which = " chunks " + std::to_string(batch.front().id) + ".." + std::to_string(batch.back().id) +
+                                  " (" + std::to_string(batch.size()) + " in one batch)";
+
+        // Compress every chunk into one buffer, in batch order, outside the lock
+        size_t bound = 0;
+        for (const batch_chunk &b : batch)
+        {
+            bound += ZSTD_compressBound(b.data_size);
+        }
+        char *frames = (char *)malloc(bound);
+        if (frames == NULL)
+        {
+            std::string note;
+            if (log_limit_write_oom.allow(note))
+            {
+                std::cerr << "Chunk write failed (out of memory): " << data_fname << which << note << std::endl;
+            }
+            return false;
+        }
+        // Each frame's offset in frames, and its size
+        std::vector<metadata_entry> placed(batch.size());
+        size_t used = 0;
+        for (size_t i = 0; i < batch.size(); i++)
+        {
+            const size_t compressed_size = ZSTD_compress(frames + used, bound - used, batch[i].data, batch[i].data_size, 5);
+            if (ZSTD_isError(compressed_size))
+            {
+                std::cerr << "ZSTD_compress failed" << std::endl;
+                free(frames);
+                return false;
+            }
+            placed[i].offset = used;
+            placed[i].size = compressed_size;
+            used += compressed_size;
+        }
+
+        bool entries_written = true;
+        bool files_kept;
+        {
+            // Released on every return and if anything below throws
+            std::lock_guard<std::timed_mutex> lock(global_chunk_cache_mutex);
+            chunk_write_lock_timer lock_timer;
+            const int64_t held_from = steady_now_ns();
+#ifdef NTRACER_TEST_HOOKS
+            test_hold_write_lock();
+#endif
+
+            fd_closer data_file, meta_file;
+            data_file.fd = open(data_fname.c_str(), O_RDWR | O_CLOEXEC);
+            if (data_file.fd < 0)
+            {
+                std::cerr << "Fopen failed (write)" << std::endl;
+                free(frames);
+                return false;
+            }
+            for (size_t i = 0; i < IO_RETRY_COUNT && meta_file.fd < 0; i++)
+            {
+                meta_file.fd = open(meta_fname.c_str(), O_RDWR | O_CLOEXEC);
+                if (meta_file.fd < 0)
+                {
+                    std::cerr << "Fopen failed (metadata write)" << std::endl;
+                }
+            }
+            if (meta_file.fd < 0)
+            {
+                free(frames);
+                return false;
+            }
+
+            if (get_fd_identity(data_file.fd) != expected.data || get_fd_identity(meta_file.fd) != expected.meta)
+            {
+                std::string note;
+                if (log_limit_files_replaced.allow(note))
+                {
+                    std::cerr << "Chunk write refused (mchunk files replaced during the write): " << data_fname
+                              << which << note << std::endl;
+                }
+                free(frames);
+                return false;
+            }
+
+#ifdef NTRACER_TEST_HOOKS
+            test_hold_in_batch();
+#endif
+
+            // Never point an entry at bytes that did not reach the file
+            const off_t base = lseek(data_file.fd, 0, SEEK_END);
+            if (base < 0 || !pwrite_all(data_file.fd, frames, used, (uint64_t)base) || !data_file.close())
+            {
+                std::string note;
+                if (log_limit_append.allow(note))
+                {
+                    std::cerr << "Chunk append failed: " << data_fname << which << note << std::endl;
+                }
+                free(frames);
+                return false;
+            }
+
+            if (!is_valid)
+            {
+                // The header could not be read, so where the entries are is unknown
+                entries_written = false;
+            }
+            else
+            {
+                for (size_t i = 0; i < batch.size(); i++)
+                {
+                    char line[sizeof(uint64_t) + sizeof(uint32_t)];
+                    const uint64_t offset = (uint64_t)base + placed[i].offset;
+                    const uint32_t size = placed[i].size;
+                    memcpy(line, &offset, sizeof(uint64_t));
+                    memcpy(line + sizeof(uint64_t), &size, sizeof(uint32_t));
+                    bool written;
+#ifdef NTRACER_TEST_HOOKS
+                    if (test_fail_entry_write(meta_fname, batch[i].id))
+                    {
+                        written = false;
+                    }
+                    else
+#endif
+                    {
+                        written = pwrite_all(meta_file.fd, line, sizeof(line), header_size + (entry_file_line_size * batch[i].id));
+                    }
+                    if (!written)
+                    {
+                        entries_written = false;
+                        std::string note;
+                        if (log_limit_entry_write.allow(note))
+                        {
+                            std::cerr << "Metadata entry write failed: " << meta_fname << " chunk " << batch[i].id << note << std::endl;
+                        }
+                    }
+                }
+            }
+            // False if close reports a write that failed late (e.g. on NFS)
+            bool meta_closed = meta_file.close();
+#ifdef NTRACER_TEST_HOOKS
+            if (test_fail_meta_close(meta_fname))
+            {
+                meta_closed = false;
+            }
+#endif
+            if (!meta_closed)
+            {
+                entries_written = false;
+                std::string note;
+                if (log_limit_entry_write.allow(note))
+                {
+                    std::cerr << "Metadata entry write failed (closing the file): " << meta_fname << which << note << std::endl;
+                }
+            }
+
+            files_kept = files_on_disk() == expected;
+            if (files_kept)
+            {
+                // Update cached mtime so our own write is not detected as
+                // an external modification on the next read.
+                last_meta_read_time = get_file_mtime_ns(meta_fname);
+            }
+            else
+            {
+                std::string note;
+                if (log_limit_files_replaced.allow(note))
+                {
+                    std::cerr << "Chunk written to mchunk files replaced during the write: " << data_fname
+                              << which << note << std::endl;
+                }
+            }
+
+            // After every entry is written and before the lines are dropped: a
+            // reader that sampled data_gen before this will not insert
+            data_gen.fetch_add(1);
+
+            for (const batch_chunk &b : batch)
+            {
+                global_chunk_line *line = global_cache_find(this_mchunk_id, b.id);
+                if (line != nullptr)
+                {
+                    global_cache_drop(line - global_chunk_cache);
+                }
+            }
+
+            batch_writes.fetch_add(1);
+            batch_chunks_written.fetch_add(batch.size());
+            const int64_t held = steady_now_ns() - held_from;
+            int64_t longest = batch_hold_max_ns.load();
+            while (held > longest && !batch_hold_max_ns.compare_exchange_weak(longest, held))
+            {
+            }
+        }
+
+        free(frames);
+        return entries_written && files_kept;
     }
 
     // True if chunk id's entry is still stamp, the entry its stored voxels
@@ -3019,6 +3306,12 @@ public:
     // not written either, if its entry is still the one it was read under
     // when that is checked again under the chunk cache lock (entry_still).
     // A chunk that cannot be read is still replaced.
+    //
+    // With batch_chunks above 0 (WRITE_BATCH_CHUNKS), the chunks to write are
+    // written in the same order, but up to batch_chunks consecutive ones of
+    // one mchunk at a time, holding the chunk cache lock once for them
+    // (overwrite_chunks). Which chunks are written, and what a failure
+    // answers, are as without it.
     bool replace_region(
         size_t scale,
         size_t xs, size_t xe,
@@ -3026,7 +3319,8 @@ public:
         size_t zs, size_t ze,
         const char *data,
         std::string &error,
-        bool skip_unchanged = false)
+        bool skip_unchanged = false,
+        size_t batch_chunks = 0)
     {
         const size_t osizex = xe - xs;
         const size_t osizey = ye - ys;
@@ -3311,6 +3605,29 @@ public:
 #endif
         }
         bool all_written = true;
+        // With batch_chunks: the chunks to write held back, all of one mchunk
+        // and in this order, until batch_chunks of them are ready or the next
+        // chunk to write is another mchunk's; a chunk's buffer is freed once
+        // its batch is written
+        std::vector<packed_reader::batch_chunk> batch;
+        size_t batch_shard = 0;
+        auto write_batch = [&]()
+        {
+            if (batch.empty())
+            {
+                return;
+            }
+            const region_shard &s = shards[batch_shard];
+            if (!s.reader->overwrite_chunks(batch, s.file_ids))
+            {
+                all_written = false;
+            }
+            for (packed_reader::batch_chunk &b : batch)
+            {
+                free(b.data);
+            }
+            batch.clear();
+        };
         for (write_chunk &w : chunks)
         {
             if (w.full || w.changed)
@@ -3346,6 +3663,17 @@ public:
                     skipped++;
                     skip_chunks_skipped.fetch_add(1);
                 }
+                else if (batch_chunks > 0)
+                {
+                    if (!batch.empty() && (batch_shard != w.shard || batch.size() >= batch_chunks))
+                    {
+                        write_batch();
+                    }
+                    batch_shard = w.shard;
+                    batch.push_back({w.span.id, w.ptr, w.span.cxsize * w.span.cysize * w.span.czsize * sizeof(uint16_t)});
+                    // Freed by write_batch
+                    w.ptr = nullptr;
+                }
                 else
                 {
                     const size_t chunk_size = w.span.cxsize * w.span.cysize * w.span.czsize * sizeof(uint16_t);
@@ -3358,6 +3686,7 @@ public:
             free(w.ptr);
             w.ptr = nullptr;
         }
+        write_batch();
 
         if (skipped > 0)
         {
