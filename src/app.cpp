@@ -142,6 +142,26 @@ typedef std::tuple<int, float, float, float, float, int> swc_line_input;
 std::unordered_map<std::string, archive_reader *> archive_inventory;
 std::mutex archive_inventory_mutex;
 
+// An entry found again on a scan: keep it if it is valid (return false, skip). An entry that
+// failed to open (a Zarr dataset whose store did not open has is_valid false) is dropped so the
+// scan retries it, as a broken SISF dataset is retried (its constructor throws and nothing is
+// inserted). Readers that are not valid are never handed out, so nothing else holds them.
+bool keep_or_drop(const std::string &dset_name)
+{
+	auto it = archive_inventory.find(dset_name);
+	if (it == archive_inventory.end())
+	{
+		return true;
+	}
+	if (it->second != nullptr && it->second->is_valid)
+	{
+		return false;
+	}
+	delete it->second;
+	archive_inventory.erase(it);
+	return true;
+}
+
 void load_inventory()
 {
 	std::cout << "|================AVAILABLE DATASETS==================|" << std::endl;
@@ -157,7 +177,7 @@ void load_inventory()
 			loc = froot.find_last_of('/');
 			std::string dset_name = froot.substr(loc + 1);
 
-			if (archive_inventory.count(dset_name) != 0)
+			if (!keep_or_drop(dset_name))
 			{
 				continue;
 			}
@@ -186,7 +206,7 @@ void load_inventory()
 			loc = froot.find_last_of('/');
 			std::string dset_name = froot.substr(loc + 1);
 
-			if (archive_inventory.count(dset_name) != 0)
+			if (!keep_or_drop(dset_name))
 			{
 				continue;
 			}
@@ -215,7 +235,7 @@ void load_inventory()
 			loc = froot.find_last_of('/');
 			std::string dset_name = froot.substr(loc + 1);
 
-			if (archive_inventory.count(dset_name) != 0)
+			if (!keep_or_drop(dset_name))
 			{
 				continue;
 			}
@@ -244,7 +264,7 @@ void load_inventory()
 			loc = froot.find_last_of('/');
 			std::string dset_name = froot.substr(loc + 1);
 
-			if (archive_inventory.count(dset_name) != 0)
+			if (!keep_or_drop(dset_name))
 			{
 				continue;
 			}
