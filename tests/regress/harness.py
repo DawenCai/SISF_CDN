@@ -1742,6 +1742,52 @@ def sc_one_mchunk_levels(server, results, sid):
         "text": f"{sent} PATCHes, {ok200} answered 200; {differ} of 3 levels differ from what was sent when read back"}
 
 
+S25_SOURCE, S25_DESCRIPTOR = "sc_desc_src", "sc_desc"
+
+
+def _voxel_check(st, body, want, z0):
+    """Whether body, an answer with status st, is want (the voxels of the
+    planes from z0 on, [z, y, x] as reads return them). The text counts the
+    voxels that differ and lists the planes, in the dataset's z, that read
+    as all zeros."""
+    if st != 200 or len(body) != want.nbytes:
+        return digest(st, body)
+    got = np.frombuffer(body, dtype=np.uint16).reshape(want.shape)
+    bad = int(np.count_nonzero(got != want))
+    zero = [z0 + k for k in range(got.shape[0]) if not got[k].any()]
+    return {"status": "match" if not bad else "mismatch", "len": None, "sha256": None,
+            "text": f"{bad} of {want.size} voxels differ; zero z planes {zero}"}
+
+
+def sc_descriptor_origin(server, results, sid):
+    """A descriptor dataset (only a descriptor.json) with one layer: all of
+    an untiled 40 x 30 x 20 image, placed at target offset (-2, -4, -6). The
+    descriptor's origin is the smallest offset on each axis (0 where none is
+    negative), so the layer starts at 0 on every axis and the descriptor
+    must read as its source. A z start taken from the y origin (-6 - -4 =
+    -2) stops the layer two planes short, and the descriptor's last two
+    planes read as zeros. Records: the source's
+    own full read against the fixture (the control), the descriptor's /info,
+    and its full read and its last plane against the fixture."""
+    vol = fixtures.pattern((1, 40, 30, 20), 25)
+    fixtures.untiled(os.path.join(server.data_dir, S25_SOURCE), vol, (32, 32, 16), RES, 1)
+    fixtures.descriptor(os.path.join(server.data_dir, S25_DESCRIPTOR),
+                        [{"source": S25_SOURCE, "source_channel": 0, "target_channel": 0,
+                          "source_size": [40, 30, 20], "target_offset": [-2, -4, -6]}], RES)
+    for ds in (S25_SOURCE, S25_DESCRIPTOR):  # both are there before the server first scans them
+        for dirpath, _, files in os.walk(os.path.join(server.data_dir, ds)):
+            for f in files:
+                _wait_visible(server, os.path.relpath(os.path.join(dirpath, f), server.data_dir))
+    want = vol[0].transpose(2, 1, 0)  # [z, y, x] as reads return
+    full = box(0, 40, 0, 30, 0, 20)
+    results[f"{sid}: source full read"] = _voxel_check(*server.request("GET", f"/{S25_SOURCE}/1/{full}"), want, 0)
+    results[f"{sid}: descriptor /info"] = digest(*server.request("GET", f"/{S25_DESCRIPTOR}/info"))
+    results[f"{sid}: descriptor full read"] = _voxel_check(
+        *server.request("GET", f"/{S25_DESCRIPTOR}/1/{full}"), want, 0)
+    results[f"{sid}: descriptor last plane"] = _voxel_check(
+        *server.request("GET", f"/{S25_DESCRIPTOR}/1/" + box(0, 40, 0, 30, 19, 20)), want[19:], 19)
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
 # s7 runs last: production dies in it, and nothing should depend on a server
@@ -1769,6 +1815,7 @@ SCENARIOS = [
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s23 raw_access unfilled part", sc_raw_access_unfilled),
     ("s24 one-mchunk levels", sc_one_mchunk_levels),
+    ("s25 descriptor layer origins", sc_descriptor_origin),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
 # sc_cpatch (s19) is not here: where its frames land in the .data depends on
