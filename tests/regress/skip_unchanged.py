@@ -62,26 +62,35 @@ for byte (except sc_cpatch, whose frame order depends on timing, and the w
 datasets). With the variable set:
 
 - batch counters: /performance shows "Batched chunk writes (up to N chunks
-  per batch): batches B; chunks written in them C; longest hold of the chunk
-  cache lock H ms", and B and C move by what each case wrote: a request
-  that writes k chunks of one mchunk opens ceil(k/N) batches, one whose
-  chunks are all left as stored opens none, and a batch refused before its
-  append is not counted. Both servers log the start-up line. In pass 0
-  neither server shows the line or logs the variable.
-- w1, w2, w3 (hook build, on the off server only, where every chunk covered
-  is written): a PATCH of other contents into 8 chunks, each read first so
-  the cache holds its old voxels. w1, chunk 8's entry write fails
+  per batch): batches B; chunks in them C; longest hold of the chunk cache
+  lock H ms", and B and C move by what each case wrote: a request that
+  writes k chunks of one mchunk opens ceil(k/N) batches, one whose chunks
+  are all left as stored opens none, and a batch refused before its append,
+  or whose append failed, is not counted (its hold still counts in H).
+  Both servers log the start-up line. In pass 0 neither server shows the
+  line or logs the variable.
+- w1, w2, w3, w4 (hook build, on the off server only, where every chunk
+  covered is written): a PATCH of other contents into 8 chunks, each read
+  first so the cache holds its old voxels. w1, chunk 8's entry write fails
   (/data/.test_fail_entry_write): 500, chunk 8 keeps its entry and old
   voxels, and the other 7, in later batches too, move into the part of
   .data the PATCH appended. w2, the .meta close fails
-  (/data/.test_fail_meta_close): 500 with all 8 written. In both every
-  chunk reads as the files on disk decode, so no cache line of old voxels
-  outlived the write. w3, while a batch waits after its file check
-  (/data/.test_hold_in_batch) the mchunk's files are replaced by copies:
-  500, the copies unchanged, "Chunk written to mchunk files replaced during
-  the write" logged, every chunk reads its old voxels, and H is at least
-  the time the batch was held. Each then answers /health 200 and takes a
-  clean PATCH.
+  (/data/.test_fail_meta_close): 500 with all 8 written, and a "Metadata
+  entry write failed: ... (closing the file)" line. In both every chunk
+  reads as the files on disk decode, so no cache line of old voxels
+  outlived the write. w3, the whole layer is read first, so the cache holds
+  every chunk; while a batch waits after its file check
+  (/data/.test_hold_in_batch) /health answers 503 with write_held_ms >= 0,
+  and the mchunk's files are replaced by another version of the layer
+  (same header, other voxels): 500, the files renamed in unchanged, "Chunk
+  written to mchunk files replaced during the write" logged, every chunk of
+  the layer reads as the new files decode (a write that took the new
+  .meta's time as its own would leave it unread, and the old files' cache
+  lines served), and H is at least the time the batch was held. w4, every
+  append fails (/data/.test_fail_append): 500, no entry moves, .data does
+  not grow, every chunk reads its old voxels as the files decode, B and C
+  do not move, and the hook's and "Chunk append failed: " lines are
+  logged. Each then answers /health 200 and takes a clean PATCH.
 - batch settings (pass 0, only when --batch names a value other than 0):
   "0" is off without a log line, "abc" and "65" are off with one
   "WRITE_BATCH_CHUNKS ignored" line, "64" logs the start-up line and writes
@@ -123,22 +132,27 @@ LOCK_MARKER = "/data/.test_hold_write_lock"
 BATCH_MARKER = "/data/.test_hold_in_batch"
 ENTRY_MARKER = "/data/.test_fail_entry_write"
 CLOSE_MARKER = "/data/.test_fail_meta_close"
+APPEND_MARKER = "/data/.test_fail_append"
 SKIP_HOOK_LINE = "TEST HOOK: write held before its skip check"
 LOCK_HOOK_LINE = "TEST HOOK: write holding the chunk cache lock"
 BATCH_HOOK_LINE = "TEST HOOK: batch held after its file check"
 ENTRY_HOOK_LINE = "TEST HOOK: entry write failed on purpose"
 CLOSE_HOOK_LINE = "TEST HOOK: .meta close failed on purpose"
+APPEND_HOOK_LINE = "TEST HOOK: append failed on purpose"
 PERF = re.compile(r"<p>Chunks covered whole by writes: (\d+); left as stored because unchanged: (\d+)</p>")
-BATCH = re.compile(r"<p>Batched chunk writes \(up to (\d+) chunks per batch\): batches (\d+); chunks written in them "
+BATCH = re.compile(r"<p>Batched chunk writes \(up to (\d+) chunks per batch\): batches (\d+); chunks in them "
                    r"(\d+); longest hold of the chunk cache lock (\d+(?:\.\d+)?) ms</p>")
 STUCK = re.compile(r"stuck lock_wait_ms=(\d+) write_held_ms=(-?\d+)\n")
 REPLACED = b"500 Internal Server Error -- Could not write chunk\n"
 # The w cases: a box of 2x2x2 chunks, written x slowest, z fastest (ids 0-3, 8-11)
 W_BOX = harness.box(0, 2 * C, 0, 2 * C, 0, 2 * C)
 W_CHUNKS = [(cx, cy, cz) for cx in range(2) for cy in range(2) for cz in range(2)]
-W_DATASETS = ["w1_pre", "w2_pre", "w3_pre"]
+W_DATASETS = ["w1_pre", "w2_pre", "w3_pre", "w4_pre"]
+# Another version of w3_pre's layer (same header, other voxels), which w3
+# renames in over it
+W3_NEW = "w3_new"
 # Datasets whose stored bytes are not compared across passes
-UNCOMPARED = {"sc_cpatch", *W_DATASETS}
+UNCOMPARED = {"sc_cpatch", *W_DATASETS, W3_NEW}
 
 
 def wpath(ds, b):
@@ -203,8 +217,8 @@ def perf_counts(server):
 
 
 def batch_counts(server):
-    """(chunks per batch, batches, chunks written in them, longest hold in ms)
-    from /performance, or None when it has no batch line."""
+    """(chunks per batch, batches, chunks in them, longest hold in ms) from
+    /performance, or None when it has no batch line."""
     st, body = server.request("GET", "/performance")
     m = BATCH.search(body.decode("utf-8", "replace")) if st == 200 else None
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)), float(m.group(4))) if m else None
@@ -629,8 +643,9 @@ def fired(server, P, skipped, tag, hook_line, ds, before, st, body):
 
 
 def w_check(server, P, tag, ds, files, x, y, kept):
-    """Checks the w box after a PATCH of y whose entry writes failed for the
-    chunks in kept: those keep their entries and read x; every other chunk
+    """Checks the w box after a PATCH of y that entered no chunk in kept (its
+    entry write, or its batch's append, failed): those keep their entries
+    and read x; every other chunk
     of the box moved into the part of .data the PATCH appended, no two
     sharing a byte, and reads y; no chunk outside the box moved; and every
     chunk reads as the files on disk decode, which a cache line of x that
@@ -662,8 +677,9 @@ def w_check(server, P, tag, ds, files, x, y, kept):
     if shared:
         P.append(f"{tag}: entries of chunks {shared} share bytes")
     if wrong:
-        old = f"their old voxels for {kept} and " if kept else ""
-        P.append(f"{tag}: chunks {wrong} read back other than {old}the PATCH's")
+        old = f"their old voxels for {kept}" if kept else ""
+        new = "the PATCH's" if len(kept) < len(W_CHUNKS) else ""
+        P.append(f"{tag}: chunks {wrong} read back other than {' and '.join(x for x in (old, new) if x)}")
     if stale:
         P.append(f"{tag}: chunks {stale} read back other than their files decode (a cache line of the old voxels "
                  "outlived the write)")
@@ -711,6 +727,9 @@ def case_w2(off, P, skipped, n):
     files = files_of(off, ds)
     before = hook_count(off, CLOSE_HOOK_LINE, ds)
     bcheck = batched(off, P, tag, n)
+    # The server logs one "Metadata entry write failed" line a second at most,
+    # and w1 has just logged one
+    time.sleep(1.1)
     off.exec("touch", CLOSE_MARKER)
     try:
         st, body = off.request("PATCH", wpath(ds, W_BOX), y.tobytes())
@@ -718,9 +737,13 @@ def case_w2(off, P, skipped, n):
         off.exec("rm", "-f", CLOSE_MARKER)
     if not fired(off, P, skipped, tag, CLOSE_HOOK_LINE, ds, before, st, body):
         return
-    print(f"  {tag}: the .meta close failed on purpose; PATCH {st} {body!r}")
+    logged = [line for line in log_lines(off) if "Metadata entry write failed: " in line and f"/{ds}/" in line
+              and "(closing the file)" in line]
+    print(f"  {tag}: the .meta close failed on purpose; PATCH {st} {body!r}; log {logged}")
     if (st, body) != (500, REPLACED):
         P.append(f"{tag}: PATCH answered {st} {body!r}; want 500 {REPLACED!r}")
+    if not logged:
+        P.append(f"{tag}: no 'Metadata entry write failed: ... (closing the file)' line for {ds}")
     bcheck(nbatches(8, n), 8)
     w_check(off, P, tag, ds, files, x, y, [])
     w_after(off, P, tag, ds, y, n)
@@ -729,6 +752,10 @@ def case_w2(off, P, skipped, n):
 def case_w3(off, P, skipped, n):
     ds, tag = "w3_pre", "w3"
     x, y = w_start(off, ds)
+    # Every chunk of the layer, so the cache holds lines of the old files
+    # outside the box too
+    read(off, ds, WHOLE, SIZE[::-1])
+    new = files_of(off, W3_NEW)
     bcheck = batched(off, P, tag, n)
     held = Held(off, BATCH_MARKER, BATCH_HOOK_LINE, wpath(ds, W_BOX), y.tobytes())
     try:
@@ -741,30 +768,36 @@ def case_w3(off, P, skipped, n):
                 skipped.append(tag)
             return
         t0 = time.monotonic()
-        off.exec("sh", "-c", f"cd /data/{ds} && cp data/{NAME}.data data/{NAME}.data.new && "
-                             f"cp meta/{NAME}.meta meta/{NAME}.meta.new && mv data/{NAME}.data.new data/{NAME}.data && "
-                             f"mv meta/{NAME}.meta.new meta/{NAME}.meta")
-        files = files_of(off, ds)
+        st_h, body_h = off.request("GET", "/health", timeout=5)
+        off.exec("sh", "-c", f"cd /data/{ds} && cp ../{W3_NEW}/data/{NAME}.data data/{NAME}.data.new && "
+                             f"cp ../{W3_NEW}/meta/{NAME}.meta meta/{NAME}.meta.new && "
+                             f"mv data/{NAME}.data.new data/{NAME}.data && mv meta/{NAME}.meta.new meta/{NAME}.meta")
         held_ms = (time.monotonic() - t0) * 1000  # the batch holds the lock for longer than this
     finally:
         st, body = held.release()
+    text = body_h.decode("utf-8", "replace")
+    m = STUCK.fullmatch(text)
     after_files = files_of(off, ds)
     logged = [line for line in log_lines(off) if "Chunk written to mchunk files replaced during the write: " in line
               and f"/{ds}/" in line]
-    served = w_chunks(off, ds)
-    wrong = [chunk_id(*k) for k in W_CHUNKS
-             if served[chunk_id(*k)] is None or not np.array_equal(served[chunk_id(*k)], w_part(x, *k))]
-    print(f"  {tag}: batch held, files replaced by copies, PATCH released {st} {body!r}; files "
-          f"{'as copied' if after_files == files else 'changed'}; log {logged}; chunks reading other than their "
-          f"old voxels {wrong}")
+    st2, vol = read(off, ds, WHOLE, SIZE[::-1])
+    stale = [chunk_id(cx, cy, cz) for cx in range(GRID[0]) for cy in range(GRID[1]) for cz in range(GRID[2])
+             if vol is None or not np.array_equal(w_part(vol, cx, cy, cz), on_disk(*new, chunk_id(cx, cy, cz)))]
+    print(f"  {tag}: batch held; /health {st_h} {text!r}; files replaced by another version of the layer, PATCH "
+          f"released {st} {body!r}; files {'as renamed in' if after_files == new else 'changed'}; log {logged}; "
+          f"layer read {st2}; chunks reading other than the new files decode {stale}")
     if (st, body) != (500, REPLACED):
         P.append(f"{tag}: PATCH answered {st} {body!r}; want 500 {REPLACED!r}, as a write into replaced files")
-    if after_files != files:
-        P.append(f"{tag}: the replaced files changed after the PATCH")
+    if st_h != 503 or m is None or int(m.group(2)) < 0:
+        P.append(f"{tag}: /health answered {st_h} {text!r} while the batch held the lock; want 503 with "
+                 "write_held_ms >= 0")
+    if after_files != new:
+        P.append(f"{tag}: the files renamed in changed after the PATCH")
     if not logged:
         P.append(f"{tag}: no 'Chunk written to mchunk files replaced during the write' line for {ds}")
-    if wrong:
-        P.append(f"{tag}: chunks {wrong} read back other than their old voxels")
+    if st2 != 200 or stale:
+        P.append(f"{tag}: chunks {stale} read back other than the files renamed in decode (read {st2}); a cache "
+                 "line of the old files outlived the write, as when the .meta renamed in is never reloaded")
     # The held batch got past its append and counts; a later one of the
     # request finds the copies at its file check and does not
     after = bcheck(1, min(n, len(W_CHUNKS)))
@@ -773,6 +806,34 @@ def case_w3(off, P, skipped, n):
         if after[3] < held_ms:
             P.append(f"{tag}: longest hold of the chunk cache lock {after[3]} ms, less than the {held_ms:.0f} ms "
                      "the batch was held")
+    w_after(off, P, tag, ds, y, n)
+
+
+def case_w4(off, P, skipped, n):
+    ds, tag = "w4_pre", "w4"
+    x, y = w_start(off, ds)
+    files = files_of(off, ds)
+    before = hook_count(off, APPEND_HOOK_LINE, ds)
+    bcheck = batched(off, P, tag, n)
+    off.exec("touch", APPEND_MARKER)
+    try:
+        st, body = off.request("PATCH", wpath(ds, W_BOX), y.tobytes())
+    finally:
+        off.exec("rm", "-f", APPEND_MARKER)
+    if not fired(off, P, skipped, tag, APPEND_HOOK_LINE, ds, before, st, body):
+        return
+    d1, _ = files_of(off, ds)
+    logged = [line for line in log_lines(off) if "Chunk append failed: " in line and f"/{ds}/" in line]
+    print(f"  {tag}: every append failed on purpose; PATCH {st} {body!r}; .data {len(files[0])} -> {len(d1)} B; "
+          f"log {logged}")
+    if (st, body) != (500, REPLACED):
+        P.append(f"{tag}: PATCH answered {st} {body!r}; want 500 {REPLACED!r}")
+    if len(d1) != len(files[0]):
+        P.append(f"{tag}: .data {len(files[0])} -> {len(d1)} B; want it as it was, with no frame appended")
+    if not logged:
+        P.append(f"{tag}: no 'Chunk append failed: ' line for {ds}")
+    bcheck(0, 0)  # every batch of the request failed its append
+    w_check(off, P, tag, ds, files, x, y, [chunk_id(*k) for k in W_CHUNKS])
     w_after(off, P, tag, ds, y, n)
 
 
@@ -881,6 +942,7 @@ def build(data, on):
     empty("e1_other")
     for i, ds in enumerate(W_DATASETS):
         pre(ds, 15 + i)
+    pre(W3_NEW, 19)
     if not on:
         return
     pre("b_pre", 6)
@@ -973,6 +1035,7 @@ def run_pass(args, root, n, batching, P, skipped, logs):
             ("w1", lambda: case_w1(off, Pp, sk, n)),
             ("w2", lambda: case_w2(off, Pp, sk, n)),
             ("w3", lambda: case_w3(off, Pp, sk, n)),
+            ("w4", lambda: case_w4(off, Pp, sk, n)),
         ]
     cases.append(("batch line", lambda: case_batch_line(on, off, Pp, n)))
     if not n:
