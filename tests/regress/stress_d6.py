@@ -13,6 +13,16 @@ without pause while a writer PATCHes it with new contents each time
 (incompressible, so each PATCH holds the cache lock for a while), and after
 each PATCH, and a pause for reads still in flight, the chunk is read twice
 more. Either of those reads returning older contents is a stale re-insert.
+With --box-edge E (a multiple of 32) the box is E^3 instead, one corner of
+the only mchunk, so each PATCH replaces (E/32)^3 whole chunks (with
+WRITE_BATCH_CHUNKS, in batches). Every chunk carries its version in its first
+voxel; each read is checked chunk by chunk, and every chunk showing an older
+version counts as a stale chunk read. With --slow-batch (a build with the test
+hooks and WRITE_BATCH_CHUNKS set) each batch waits 5 ms after its append and
+before its entries, while the .meta is unchanged and reads go on without
+reloading it: a batch that bumped data_gen before writing its entries lets a
+read in that wait take the new data_gen with the old entries and put the old
+chunks back, which a run without the wait almost never shows.
 
 --mode rename: a request keeps an mchunk's .meta and .data open while it
 reads the mchunk's chunks, and a descriptor stays on the file it opened when
@@ -37,29 +47,42 @@ rename comes at a later point in each cycle (--delay, then --sweep spread
 over the cycles), so it lands before, during and after the PATCH's reads and
 writes. Afterwards the whole mchunk is read: outside the box only the new
 version may show, and inside only the new version or the PATCH's value. A
-PATCH that the replacement interrupted may answer 500.
+PATCH that the replacement interrupted may answer 500, and must then have left
+the new files exactly as they were renamed in: the staged files are hashed
+before the PATCH starts (the rename moves those same files in, so nothing the
+PATCH does can reach them earlier) and the live files again once it answered.
 
 The copies and renames run inside the server's container: a file shared into
 a container from the host can be read with its old contents for a moment
 after a rename on the host, which would look like the stale reads these
 modes look for.
 
+In every mode, before the container is removed, /performance must show the
+batched chunk writes line when --env sets WRITE_BATCH_CHUNKS to anything but
+0 (with batches counted, and in patch mode chunks written in them) and must
+not show it otherwise, and the server's log, saved as server.log in the work
+folder, must have no AddressSanitizer report.
+
     python stress_d6.py --image IMAGE --work DIR [--platform linux/arm64]
                         [--mode patch] [--writes 300] [--readers 8]
+                        [--box-edge 32] [--env KEY=VALUE ...] [--slow-batch]
     python stress_d6.py --image IMAGE --work DIR --mode rename [--cycles 20]
                         [--chunk 8] [--delay 0.05]
     python stress_d6.py --image IMAGE --work DIR --mode rename-write
                         [--cycles 12] [--delay 0.05] [--sweep 5.5]
 
-Exit status 1 if any stale read was seen. A run that sees none proves
-nothing on its own: run the same settings against an image without the fix
-first, and rely on them only if that run does see stale reads.
+--env starts the server with that environment variable (repeatable, any
+mode). Exit status 1 if any stale read was seen or a check above failed. A
+run that sees no stale read proves nothing on its own: run the same settings
+against an image without the fix first, and rely on them only if that run
+does see stale reads.
 """
 
 import argparse
 import http.client
 import multiprocessing as mp
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -71,42 +94,65 @@ import numpy as np
 import fixtures
 
 DS = "d6_seg"
-BOX = "0-32_0-32_0-32"  # chunk 0 of the only mchunk, covered whole, so a PATCH never reads it first
 RES = (650, 650, 1500)
-N = 32 * 32 * 32
 
 RENAME_DS = "d6_rename"
 RENAME_SIZE = (512, 512, 128)
 MCHUNK_NAME = "chunk_0_0_0.0.1X"
 
+# Logged once by a build with the test hooks when --slow-batch slows its batches
+SLOW_BATCH_LINE = "TEST HOOK: batches wait 5 ms after their append"
 
-def contents(v):
-    """Chunk contents for version v: noise, with v in the first voxel (the
-    voxel at x, y, z = 0 comes first in both the request and the answer)."""
-    a = np.random.default_rng(v).integers(0, 65536, size=N, dtype=np.uint16)
-    a[0] = v
+# What /performance shows while WRITE_BATCH_CHUNKS is on (the hold is in ms)
+BATCH_LINE = re.compile(r"<p>Batched chunk writes \(up to (\d+) chunks per batch\): batches (\d+); "
+                        r"chunks written in them (\d+); longest hold of the chunk cache lock (\d+(?:\.\d+)?) ms</p>")
+
+
+def box(edge):
+    """The patch mode box: from the origin, so with the dataset's mchunk of
+    (2 edge, 2 edge, edge) it is one corner of it and every chunk it touches
+    is covered whole, so a PATCH never reads one first. 0-32_0-32_0-32 is
+    chunk 0 alone."""
+    return f"0-{edge}_0-{edge}_0-{edge}"
+
+
+def contents(v, edge=32):
+    """Box contents for version v: noise, with v in the first voxel of every
+    32^3 chunk. The box is x fastest in both the request and the answer, so
+    the voxel at x, y, z = 0 comes first, and at edge 32 only that one is v."""
+    a = np.random.default_rng(v).integers(0, 65536, size=edge ** 3, dtype=np.uint16)
+    a.reshape(edge, edge, edge)[::32, ::32, ::32] = v
     return a
 
 
-def get_version(conn):
-    conn.request("GET", f"/{DS}/1/{BOX}")
+def get_versions(conn, edge):
+    """Reads the box; returns each chunk's version (from its first voxel),
+    and raises if a chunk's contents are not that version's (a torn chunk)."""
+    conn.request("GET", f"/{DS}/1/{box(edge)}")
     r = conn.getresponse()
     body = r.read()
-    if r.status != 200 or len(body) != 2 * N:
+    if r.status != 200 or len(body) != 2 * edge ** 3:
         raise RuntimeError(f"read answered {r.status} with {len(body)} bytes")
-    a = np.frombuffer(body, dtype=np.uint16)
-    v = int(a[0])
-    if v and not np.array_equal(a, contents(v)):
-        raise RuntimeError(f"read returned version {v} with contents that are not that version's")
-    return v
+    a = np.frombuffer(body, dtype=np.uint16).reshape(edge, edge, edge)  # z, y, x
+    versions = a[::32, ::32, ::32]
+    for v in np.unique(versions):
+        if not v:
+            continue
+        want = contents(int(v), edge).reshape(edge, edge, edge)
+        for cz, cy, cx in np.argwhere(versions == v) * 32:
+            c = np.s_[cz:cz + 32, cy:cy + 32, cx:cx + 32]
+            if not np.array_equal(a[c], want[c]):
+                where = f" in the chunk at x, y, z = {cx}, {cy}, {cz}" if versions.size > 1 else ""
+                raise RuntimeError(f"read returned version {v}{where} with contents that are not that version's")
+    return [int(v) for v in versions.reshape(-1)]
 
 
-def reader(port, stop, count, errors):
+def reader(port, path, stop, count, errors):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     n = 0
     try:
         while not stop.is_set():
-            conn.request("GET", f"/{DS}/1/{BOX}")
+            conn.request("GET", path)
             r = conn.getresponse()
             r.read()
             n += 1
@@ -116,11 +162,13 @@ def reader(port, stop, count, errors):
         count.value += n
 
 
-def start_server(args, work):
+def start_server(args, work, env):
     """Starts the image on work; returns (container name, port)."""
     name = f"cdn-stress-d6-{os.getpid()}"
     cmd = ["docker", "run", "-d", "--pull", "never", "--name", name, "-p", "127.0.0.1::6000",
            "-v", f"{work}:/data"]
+    for k, v in env.items():
+        cmd += ["-e", f"{k}={v}"]
     if args.platform:
         cmd += ["--platform", args.platform]
     subprocess.run(cmd + [args.image], check=True, capture_output=True)
@@ -144,13 +192,73 @@ def start_server(args, work):
     return name, port
 
 
-def run_patch(args, work):
-    fixtures.segmentation(os.path.join(work, DS), (64, 64, 32), (64, 64, 32), RES)
-    name, port = start_server(args, work)
-    stale, procs = [], []
+def check_server(name, port, work, env, need_chunks):
+    """Run before the container is removed. /performance must show the
+    batched chunk writes line if env turns WRITE_BATCH_CHUNKS on (anything but
+    unset, empty or 0, so a value the server ignores fails here), with batches
+    counted and, if need_chunks, chunks written in them, and must not show it
+    otherwise. The server's log is saved to work/server.log and must have no
+    AddressSanitizer report. Returns (lines to print, number of problems)."""
+    lines, problems = [], 0
+    value = env.get("WRITE_BATCH_CHUNKS", "")
+    on = re.fullmatch(r"0*", value) is None
+    setting = f"WRITE_BATCH_CHUNKS={value}" if "WRITE_BATCH_CHUNKS" in env else "WRITE_BATCH_CHUNKS unset"
+    try:
+        st, body = request(port, "GET", "/performance")
+    except Exception as e:  # noqa: BLE001 - reported below
+        st, body = f"no answer ({e})", b""
+    text = body.decode("utf-8", "replace") if st == 200 else ""
+    m = BATCH_LINE.search(text)
+    # Off, not even a line in another form may show
+    shown = "Batched chunk writes" in text
+    if st != 200:
+        lines.append(f"  PROBLEM /performance answered {st}")
+        problems += 1
+    elif shown and not on:
+        lines.append(f"  PROBLEM /performance has a batched chunk writes line with {setting}")
+        problems += 1
+    elif not on:
+        lines.append(f"  OK /performance has no batched chunk writes line with {setting}")
+    elif m is None:
+        form = " in the expected form" if shown else ""
+        lines.append(f"  PROBLEM /performance has no batched chunk writes line{form} with {setting}")
+        problems += 1
+    else:
+        up_to, batches, chunks = (int(m.group(i)) for i in (1, 2, 3))
+        seen = f"up to {up_to}, {batches} batches, {chunks} chunks written in them, longest hold {m.group(4)} ms"
+        if value.isdigit() and up_to != int(value):
+            lines.append(f"  PROBLEM /performance batched chunk writes line says {seen}, with {setting}")
+            problems += 1
+        elif batches == 0 or (need_chunks and chunks == 0):
+            lines.append(f"  PROBLEM /performance batched chunk writes line counted nothing: {seen}")
+            problems += 1
+        else:
+            lines.append(f"  OK /performance batched chunk writes: {seen}")
+
+    log = os.path.join(work, "server.log")
+    with open(log, "w") as f:
+        subprocess.run(["docker", "logs", name], stdout=f, stderr=subprocess.STDOUT)
+    with open(log, errors="replace") as f:
+        asan = f.read().count("ERROR: AddressSanitizer")
+    if asan:
+        lines.append(f"  PROBLEM the server's log has {asan} AddressSanitizer reports ({log})")
+        problems += 1
+    else:
+        lines.append(f"  OK the server's log has no AddressSanitizer report ({log})")
+    return lines, problems
+
+
+def run_patch(args, work, env):
+    e = args.box_edge
+    path = f"/{DS}/1/{box(e)}"
+    fixtures.segmentation(os.path.join(work, DS), (2 * e, 2 * e, e), (2 * e, 2 * e, e), RES)
+    name, port = start_server(args, work, env)
+    stale, procs, checks, failed = [], [], [], 0
     stop, count, errors = mp.Event(), mp.Value("q", 0), mp.Queue()
     try:
-        procs = [mp.Process(target=reader, args=(port, stop, count, errors)) for _ in range(args.readers)]
+        if args.slow_batch:
+            in_container(name, "touch /data/.test_slow_batch")
+        procs = [mp.Process(target=reader, args=(port, path, stop, count, errors)) for _ in range(args.readers)]
         for p in procs:
             p.start()
 
@@ -159,14 +267,14 @@ def run_patch(args, work):
         t0 = time.time()
         for n in range(args.writes):
             v = (n % 60000) + 1
-            wconn.request("PATCH", f"/{DS}+token={fixtures.TOKEN}/write/1/{BOX}", contents(v).tobytes())
+            wconn.request("PATCH", f"/{DS}+token={fixtures.TOKEN}/write/1/{box(e)}", contents(v, e).tobytes())
             r = wconn.getresponse()
             r.read()
             if r.status != 200:
                 raise RuntimeError(f"PATCH {n} answered {r.status}")
             time.sleep(args.settle)
-            got = [get_version(cconn), get_version(cconn)]
-            if any(g != v for g in got):
+            got = [get_versions(cconn, e), get_versions(cconn, e)]
+            if any(g != v for read in got for g in read):
                 stale.append((n, v, got))
             if not errors.empty():
                 break
@@ -175,18 +283,38 @@ def run_patch(args, work):
         stop.set()
         for p in procs:
             p.join(timeout=30)
+        checks, failed = check_server(name, port, work, env, need_chunks=True)
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    if args.slow_batch:
+        # The hook says so once; without it the run tested nothing slowed
+        with open(os.path.join(work, "server.log"), errors="replace") as f:
+            slowed = SLOW_BATCH_LINE in f.read()
+        if slowed:
+            checks.append("  OK the batches waited after their append (--slow-batch)")
+        else:
+            checks.append(f"  PROBLEM --slow-batch: the server's log has no '{SLOW_BATCH_LINE}' line "
+                          f"(a build without the test hooks, or no batch ran)")
+            failed += 1
 
     errs = []
     while not errors.empty():
         errs.append(errors.get())
-    print(f"image {args.image}: {args.writes} PATCHes in {elapsed:.1f} s, {count.value} concurrent reads "
-          f"from {args.readers} processes, {len(stale)} PATCHes followed by a stale read")
+    stale_chunks = sum(g != v for _, v, got in stale for read in got for g in read)
+    print(f"image {args.image}, env {env or 'none'}: {args.writes} PATCHes of box {box(e)} in {elapsed:.1f} s, "
+          f"{count.value} concurrent reads from {args.readers} processes, {len(stale)} PATCHes followed by a "
+          f"stale read, {stale_chunks} stale chunk reads")
     for n, v, got in stale[:10]:
-        print(f"  PATCH {n} wrote version {v}; the two reads after it returned {got}")
-    for e in errs:
-        print(f"  ERROR {e}")
-    return 1 if stale or errs else 0
+        if len(got[0]) == 1:
+            print(f"  PATCH {n} wrote version {v}; the two reads after it returned {[read[0] for read in got]}")
+        else:
+            old = sorted({g for read in got for g in read if g != v})
+            print(f"  PATCH {n} wrote version {v}; the two reads after it returned "
+                  f"{[sum(g != v for g in read) for read in got]} stale chunks, versions {old}")
+    for err in errs:
+        print(f"  ERROR {err}")
+    for line in checks:
+        print(line)
+    return 1 if stale or errs or failed else 0
 
 
 def request(port, method, path, body=None):
@@ -207,6 +335,13 @@ def in_container(name, script):
     """Runs a shell script inside the server's container; see the module
     docstring for why the files are copied and renamed there."""
     subprocess.run(["docker", "exec", name, "sh", "-c", script], check=True, capture_output=True)
+
+
+def hashes_in_container(name, paths):
+    """SHA-256 of each file, read inside the server's container, as above."""
+    out = subprocess.run(["docker", "exec", name, "sha256sum", *paths], check=True, capture_output=True,
+                         text=True).stdout
+    return [line.split()[0] for line in out.splitlines()]
 
 
 def build_rename_dataset(args, work):
@@ -240,7 +375,7 @@ def replace_live(name, live):
     in_container(name, f"mv -f /data/stage/next.data {live['data']} && mv -f /data/stage/next.meta {live['meta']}")
 
 
-def run_rename(args, work):
+def run_rename(args, work, env):
     X, Y, Z = RENAME_SIZE
     c = args.chunk
     versions, live = build_rename_dataset(args, work)
@@ -251,8 +386,8 @@ def run_rename(args, work):
     last_path = f"/{RENAME_DS}/1/" + "{}-{}_{}-{}_{}-{}".format(*last)
     long_path = f"/{RENAME_DS}+project={Z}/1/0-{X}_0-{Y}_0-1"
 
-    name, port = start_server(args, work)
-    rows = []
+    name, port = start_server(args, work, env)
+    rows, checks, failed = [], [], 0
     try:
         st, _ = request(port, "GET", f"/{RENAME_DS}/1/0-1_0-1_0-1")  # builds the reader
         if st != 200:
@@ -295,20 +430,23 @@ def run_rename(args, work):
                          "after_reload_s": round(res["R_done"] - t_reload, 3), "read_after": read_after,
                          "patch": stp, "edited_voxel": edited, "written": written})
     finally:
+        checks, failed = check_server(name, port, work, env, need_chunks=False)
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 
     landed = [r for r in rows if r["landed"]]
     stale_read = [r for r in rows if r["read_after"] != "new"]
     stale_write = [r for r in rows if r["written"] != "new" or r["patch"] != 200 or r["edited_voxel"] != 7]
-    print(f"image {args.image}: {len(rows)} cycles of {args.chunk}^3 chunks, {len(landed)} landed "
+    print(f"image {args.image}, env {env or 'none'}: {len(rows)} cycles of {args.chunk}^3 chunks, {len(landed)} landed "
           f"(long read still running {args.margin} s after the reload); "
           f"{len(stale_read)} cycles with a stale read, {len(stale_write)} with a stale or failed PATCH")
     for r in rows:
         print(f"  {r}")
-    return 1 if stale_read or stale_write else 0
+    for line in checks:
+        print(line)
+    return 1 if stale_read or stale_write or failed else 0
 
 
-def run_rename_write(args, work):
+def run_rename_write(args, work, env):
     X, Y, Z = RENAME_SIZE
     versions, live = build_rename_dataset(args, work)
 
@@ -321,8 +459,8 @@ def run_rename_write(args, work):
     patch_path = f"/{RENAME_DS}+token={fixtures.TOKEN}/write/1/" + "{}-{}_{}-{}_{}-{}".format(*b)
     whole_path = f"/{RENAME_DS}/1/0-{X}_0-{Y}_0-{Z}"
 
-    name, port = start_server(args, work)
-    rows = []
+    name, port = start_server(args, work, env)
+    rows, checks, failed = [], [], 0
     try:
         st, _ = request(port, "GET", f"/{RENAME_DS}/1/0-1_0-1_0-1")  # builds the reader
         if st != 200:
@@ -330,6 +468,8 @@ def run_rename_write(args, work):
         for k in range(args.cycles):
             new = versions[(k + 1) % 3]
             stage_version(name, (k + 1) % 3)
+            # The files the rename moves in, before anything can write to them
+            staged = hashes_in_container(name, ["/data/stage/next.data", "/data/stage/next.meta"])
             delay = args.delay + args.sweep * k / max(1, args.cycles - 1)
             res = {}
 
@@ -344,6 +484,8 @@ def run_rename_write(args, work):
             replace_live(name, live)
             t_ren = time.time()
             th.join()
+            # A PATCH that answered 500 must not have written into them
+            kept = hashes_in_container(name, [live["data"], live["meta"]]) == staged
             request(port, "GET", f"/{RENAME_DS}/1/0-1_0-1_0-1")  # reloads the header if nothing has
             st, whole = request(port, "GET", whole_path)
             if st != 200:
@@ -356,19 +498,27 @@ def run_rename_write(args, work):
             painted = int(((got == 9) & inside & (new != 9)).sum())
             rows.append({"cycle": k, "rename_at_s": round(t_ren - t0, 3), "patch_s": round(res["P_done"] - t0, 3),
                          "patch": res["P"][0], "answer": res["P"][1][:80].decode("utf-8", "replace"),
-                         "painted_in_new_files": painted,
+                         "painted_in_new_files": painted, "new_files_unchanged": kept,
                          "stale_outside": bad_out, "stale_inside": bad_in})
     finally:
+        checks, failed = check_server(name, port, work, env, need_chunks=False)
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 
-    bad = [r for r in rows if r["stale_outside"] or r["stale_inside"] or r["patch"] not in (200, 500)]
+    stale = [r for r in rows if r["stale_outside"] or r["stale_inside"] or r["patch"] not in (200, 500)]
+    # A PATCH that answered 500 left the new files untouched
+    touched = [r for r in rows if r["patch"] == 500 and not r["new_files_unchanged"]]
     during = [r for r in rows if r["rename_at_s"] < r["patch_s"]]
-    print(f"image {args.image}: {len(rows)} cycles of {args.chunk}^3 chunks, {len(during)} with the rename before "
-          f"the PATCH answered ({sum(r['patch'] == 500 for r in rows)} PATCHes answered 500); "
-          f"{len(bad)} cycles with old voxels written into the new files")
+    # The rename landed during the write-back
+    in_write = [r for r in rows if r["patch"] == 500 and "Could not write chunk" in r["answer"]]
+    print(f"image {args.image}, env {env or 'none'}: {len(rows)} cycles of {args.chunk}^3 chunks, {len(during)} with "
+          f"the rename before the PATCH answered ({sum(r['patch'] == 500 for r in rows)} PATCHes answered 500, "
+          f"{len(in_write)} of them 'Could not write chunk'); {len(stale)} cycles with old voxels written into the "
+          f"new files, {len(touched)} with a PATCH that answered 500 and changed them")
     for r in rows:
         print(f"  {r}")
-    return 1 if bad else 0
+    for line in checks:
+        print(line)
+    return 1 if stale or touched or failed else 0
 
 
 def main():
@@ -380,6 +530,8 @@ def main():
     ap.add_argument("--writes", type=int, default=300, help="patch mode: PATCHes")
     ap.add_argument("--readers", type=int, default=8, help="patch mode: reader processes")
     ap.add_argument("--settle", type=float, default=0.03, help="patch mode: pause after each PATCH before checking, in s")
+    ap.add_argument("--box-edge", type=int, default=32,
+                    help="patch mode: edge of the box PATCHed and read, a multiple of 32 (32 is one chunk)")
     ap.add_argument("--cycles", type=int, default=20, help="rename mode: replacements")
     ap.add_argument("--chunk", type=int, default=8, help="rename mode: chunk edge; small chunks make the long read long")
     ap.add_argument("--delay", type=float, default=0.05, help="rename mode: from the long read's start to the rename, in s")
@@ -387,12 +539,35 @@ def main():
                     help="rename-write mode: the rename comes delay + sweep * k / (cycles - 1) s after the PATCH starts")
     ap.add_argument("--margin", type=float, default=0.2,
                     help="rename mode: how long the long read must go on after the reload for the cycle to count as landed, in s")
+    ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                    help="environment variable for the server (repeatable)")
+    ap.add_argument("--slow-batch", action="store_true",
+                    help="patch mode with WRITE_BATCH_CHUNKS: each batch waits 5 ms after its append, before its "
+                         "entries (needs a build with the test hooks)")
     args = ap.parse_args()
+    env = {}
+    for kv in args.env:
+        key, sep, value = kv.partition("=")
+        if not sep or not key:
+            ap.error(f"--env takes KEY=VALUE, not {kv!r}")
+        env[key] = value
+    if args.mode == "patch":
+        e = args.box_edge
+        # The cache size the server will use (it ignores a value out of range)
+        lines = env.get("CHUNK_CACHE_LINES", "")
+        lines = int(lines) if re.fullmatch(r"[0-9]+", lines) and 0 < int(lines) <= 1000000 else 100
+        if e <= 0 or e % 32:
+            ap.error(f"--box-edge must be a positive multiple of 32, not {e}")
+        if (e // 32) ** 3 >= lines:
+            ap.error(f"--box-edge {e} covers {(e // 32) ** 3} chunks; "
+                     f"it must be fewer than the chunk cache's {lines} lines")
+    if args.slow_batch and (args.mode != "patch" or re.fullmatch(r"[0-9]*[1-9][0-9]*", env.get("WRITE_BATCH_CHUNKS", "")) is None):
+        ap.error("--slow-batch is for --mode patch with WRITE_BATCH_CHUNKS above 0")
 
     work = os.path.abspath(args.work)
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
-    return {"patch": run_patch, "rename": run_rename, "rename-write": run_rename_write}[args.mode](args, work)
+    return {"patch": run_patch, "rename": run_rename, "rename-write": run_rename_write}[args.mode](args, work, env)
 
 
 if __name__ == "__main__":

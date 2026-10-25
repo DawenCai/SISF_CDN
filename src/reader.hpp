@@ -265,6 +265,26 @@ bool test_fail_entry_write(const std::string &meta_fname, size_t id)
     return true;
 }
 
+// Test-only, as above: while <data path>/.test_slow_batch exists, a batch waits
+// 5 ms holding the chunk cache lock after its append, before it writes any
+// entry. The .meta is not yet changed then, so reads go on without reloading
+// it, and tests/regress/stress_d6.py --slow-batch widens the moment in which
+// a read can take data_gen and the old entries while a batch runs.
+void test_slow_batch()
+{
+    if (access((DATA_PATH + ".test_slow_batch").c_str(), F_OK) != 0)
+    {
+        return;
+    }
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true))
+    {
+        std::cerr << "TEST HOOK: batches wait 5 ms after their append while " << DATA_PATH << ".test_slow_batch exists"
+                  << std::endl;
+    }
+    usleep(5 * 1000);
+}
+
 // Test-only, as above: while <data path>/.test_fail_meta_close exists, a batch
 // closes .meta and then counts the close as failed.
 bool test_fail_meta_close(const std::string &meta_fname)
@@ -1644,6 +1664,9 @@ public:
             }
             else
             {
+#ifdef NTRACER_TEST_HOOKS
+                test_slow_batch();
+#endif
                 for (size_t i = 0; i < batch.size(); i++)
                 {
                     char line[sizeof(uint64_t) + sizeof(uint32_t)];
