@@ -55,9 +55,13 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
+          # The test hooks go into the sanitizer build only, which is never
+          # published, so the hook cases below run there instead of reporting
+          # SKIPPED
           build-args: |
             BUILD_THREAD=4
             SANITIZE=${{ matrix.sanitize }}
+            TEST_HOOKS=${{ matrix.sanitize }}
           load: true
           tags: sisf_cdn:candidate
 
@@ -75,6 +79,21 @@ jobs:
           python harness.py --baseline "$BASELINE" --candidate sisf_cdn:candidate \
             --work "$RUNNER_TEMP/regress" --allow expected_diffs.json --report "$RUNNER_TEMP/report.json"
 
+      # The same harness with the candidate's chunk writes batched: batches
+      # store the same bytes and give the same answers, so the allow file is
+      # the same. 64 is one 128^3 box; 5 splits the harness's larger requests
+      # into several batches with a short last one. The start-up line shows
+      # the server took the setting.
+      - name: Regression harness with batched chunk writes (WRITE_BATCH_CHUNKS=64 and 5)
+        if: ${{ !cancelled() }}
+        working-directory: tests/regress
+        run: |
+          for n in 64 5; do
+            python harness.py --baseline "$BASELINE" --candidate sisf_cdn:candidate --candidate-env WRITE_BATCH_CHUNKS=$n \
+              --work "$RUNNER_TEMP/regress-b$n" --allow expected_diffs.json --report "$RUNNER_TEMP/report-b$n.json"
+            grep -n "(WRITE_BATCH_CHUNKS=$n)" "$RUNNER_TEMP/regress-b$n/candidate.log"
+          done
+
       # The harness sends its PATCHes one at a time, so it passes a write that
       # lets a read racing it put the old chunk back into the chunk cache (a
       # PATCH that does not bump the mchunk's data_gen). This PATCHes one chunk
@@ -89,18 +108,41 @@ jobs:
           python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6" \
             --mode patch --writes 300 --readers 8
 
+      # With WRITE_BATCH_CHUNKS one hold of the lock writes a whole batch and
+      # bumps data_gen once, so the same race over a 128^3 box (64 chunks, one
+      # batch per PATCH), every chunk checked; on the sanitizer build, which
+      # has the test hooks, each batch also waits after its append
+      # (--slow-batch), so a data_gen bump placed before the entries shows;
+      # then files replaced by rename while a long batched PATCH writes (a
+      # short sweep, since batched PATCHes are quick), where a PATCH that
+      # answers 500 must leave the new files untouched.
+      - name: D6 stress with batched chunk writes (WRITE_BATCH_CHUNKS=64)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        working-directory: tests/regress
+        run: |
+          python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6_b64" \
+            --mode patch --writes 300 --readers 8 --box-edge 128 --env WRITE_BATCH_CHUNKS=64 \
+            ${{ matrix.sanitize == 'ON' && '--slow-batch' || '' }}
+          python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6_rw_b64" \
+            --mode rename-write --cycles 12 --sweep 0.6 --env WRITE_BATCH_CHUNKS=64
+
       # SKIP_UNCHANGED_CHUNKS is off in the harness above, and none of its
       # requests resends a whole chunk unchanged, so it never reaches the skip
       # path. This runs the candidate with the switch on against itself with
-      # it off, in the cases that need no hook build (those that do report
-      # SKIPPED), and fails on an AddressSanitizer report in either server's
-      # log. It runs even when the harness failed, so both results show.
-      - name: SKIP_UNCHANGED_CHUNKS (switch on against off)
+      # it off, once with writes not batched and once each with
+      # WRITE_BATCH_CHUNKS=64 and 3 (stored files compared with the first
+      # pass), and fails on an AddressSanitizer report in any server's log.
+      # The sanitizer build has the test hooks, so there the hook cases must
+      # run; the release build reports them SKIPPED. It runs even when the
+      # harness failed, so both results show.
+      - name: SKIP_UNCHANGED_CHUNKS (switch on against off) and batched writes
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
+        timeout-minutes: 15
         working-directory: tests/regress
         run: |
-          python skip_unchanged.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/skip_unchanged"
+          python skip_unchanged.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/skip_unchanged" --batch 0,64,3 \
+            ${{ matrix.sanitize == 'ON' && '--require-hook' || '' }}
 
       # ASan aborts on its first error, which the harness already fails as a
       # candidate crash; this step names the report. UBSan messages do not stop
@@ -108,24 +150,24 @@ jobs:
       # store).
       - name: Sanitizer reports in the candidate's logs
         if: always() && matrix.sanitize == 'ON'
-        working-directory: ${{ runner.temp }}/regress
+        working-directory: ${{ runner.temp }}
         run: |
-          ls candidate*.log
-          if grep -n "ERROR: AddressSanitizer" candidate*.log; then
+          ls regress*/candidate*.log
+          if grep -n "ERROR: AddressSanitizer" regress*/candidate*.log; then
             echo "AddressSanitizer reported an error (above)"
             exit 1
           else
-            echo "no AddressSanitizer reports in $(ls candidate*.log | wc -l) candidate logs"
+            echo "no AddressSanitizer reports in $(ls regress*/candidate*.log | wc -l) candidate logs"
           fi
           echo "UBSan runtime errors by site:"
-          grep -h "runtime error:" candidate*.log | sed -E 's/^[^ ]*\/src\///; s/value [0-9]+/value N/' | sort | uniq -c | sort -rn | head -20 || true
+          grep -h "runtime error:" regress*/candidate*.log | sed -E 's/^[^ ]*\/src\///; s/value [0-9]+/value N/' | sort | uniq -c | sort -rn | head -20 || true
 
-      - name: Keep the report
+      - name: Keep the reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: regress-report-sanitize-${{ matrix.sanitize }}
-          path: ${{ runner.temp }}/report.json
+          path: ${{ runner.temp }}/report*.json
 
       - name: Publish to ghcr.io
         if: github.event_name == 'workflow_dispatch' && inputs.publish && matrix.sanitize == 'OFF'
