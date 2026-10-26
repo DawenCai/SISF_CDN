@@ -65,9 +65,11 @@ if(NTRACER_SANITIZE)
   target_link_options(nTracer_cdn PRIVATE -fsanitize=address,undefined -static-libasan -static-libubsan)
 endif()
 
-# Test-only switches for tests/regress/health.py: a write waits holding the
-# chunk cache lock while <data path>/.test_hold_write_lock exists. Never on
-# in a release build; with it off none of that code is compiled.
+# Test-only hooks for tests/regress (health.py, skip_unchanged.py and
+# stress_d6.py): marker files under the data path make a write wait holding the
+# chunk cache lock, or make a step of a batched write fail (see the hooks in
+# src/reader.hpp). Never on in a release build; with it off none of that code
+# is compiled. The Dockerfile sets it from TEST_HOOKS.
 option(NTRACER_TEST_HOOKS "Build nTracer_cdn with test-only hooks" OFF)
 if(NTRACER_TEST_HOOKS)
   target_compile_definitions(nTracer_cdn PRIVATE NTRACER_TEST_HOOKS=1)
