@@ -3266,7 +3266,7 @@ public:
                 const int64_t layer_end_x = layer_start_x + l->sizex;
                 const int64_t layer_start_y = l->ooffsety - descriptor_y_origin;
                 const int64_t layer_end_y = layer_start_y + l->sizey;
-                const int64_t layer_start_z = l->ooffsetz - descriptor_y_origin;
+                const int64_t layer_start_z = l->ooffsetz - descriptor_z_origin;
                 const int64_t layer_end_z = layer_start_z + l->sizez;
 
                 // Calculate the overlap start-stops, in output space
