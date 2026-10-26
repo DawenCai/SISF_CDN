@@ -58,7 +58,8 @@ before the PATCH starts (the rename moves those same files in, so nothing the
 PATCH does can reach them earlier) and the live files again once it answered.
 With --sweep auto one PATCH of the box is timed first, with no rename (the
 live version is then put back), and the renames come from 0.1 to 0.9 of that
-time. A PATCH that answered 500 "Could not write chunk" had the rename land
+time, each started earlier by the time a docker exec takes (measured too, as
+the rename runs in one). A PATCH that answered 500 "Could not write chunk" had the rename land
 during its write-back; with --require-mid-write a run with none fails, since
 it tested nothing there.
 
@@ -530,9 +531,16 @@ def run_rename_write(args, work, env):
             st, _ = request(port, "GET", f"/{RENAME_DS}/1/0-1_0-1_0-1")
             if st != 200:
                 raise RuntimeError(f"read after the timing PATCH answered {st}")
-            start, sweep = 0.1 * took, 0.8 * took
+            # The rename lands a docker exec after its slot; start that much earlier
+            execs = []
+            for _ in range(3):
+                t0 = time.time()
+                in_container(name, "true")
+                execs.append(time.time() - t0)
+            lag = sorted(execs)[1]
+            start, sweep = max(0.0, 0.1 * took - lag), 0.8 * took
             print("--sweep auto: one PATCH of box {}-{}_{}-{}_{}-{}".format(*b) + f" took {took:.3f} s with no rename; "
-                  f"delay {start:.3f} s, sweep {sweep:.3f} s")
+                  f"a docker exec takes {lag:.3f} s; delay {start:.3f} s, sweep {sweep:.3f} s")
         for k in range(args.cycles):
             new = versions[(k + 1) % 3]
             stage_version(name, (k + 1) % 3)

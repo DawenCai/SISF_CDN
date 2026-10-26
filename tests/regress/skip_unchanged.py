@@ -87,10 +87,12 @@ datasets). With the variable set:
   the layer reads as the new files decode (a write that took the new
   .meta's time as its own would leave it unread, and the old files' cache
   lines served), and H is at least the time the batch was held. w4, every
-  append fails (/data/.test_fail_append): 500, no entry moves, .data does
-  not grow, every chunk reads its old voxels as the files decode, B and C
-  do not move, and the hook's and "Chunk append failed: " lines are
-  logged. Each then answers /health 200 and takes a clean PATCH.
+  append fails (/data/.test_fail_append), the first batch after waiting at
+  the lock (/data/.test_hold_write_lock) for a second longer than H so far:
+  500, no entry moves, .data does not grow, every chunk reads its old
+  voxels as the files decode, B and C do not move while H takes in that
+  wait, and the hook's and "Chunk append failed: " lines are logged. Each
+  then answers /health 200 and takes a clean PATCH.
 - batch settings (pass 0, only when --batch names a value other than 0):
   "0" is off without a log line, "abc" and "65" are off with one
   "WRITE_BATCH_CHUNKS ignored" line, "64" logs the start-up line and writes
@@ -775,7 +777,8 @@ def case_w3(off, P, skipped, n):
         held_ms = (time.monotonic() - t0) * 1000  # the batch holds the lock for longer than this
     finally:
         st, body = held.release()
-    text = body_h.decode("utf-8", "replace")
+    # A request that did not answer comes back as a status word and a str
+    text = body_h.decode("utf-8", "replace") if isinstance(body_h, bytes) else str(body_h)
     m = STUCK.fullmatch(text)
     after_files = files_of(off, ds)
     logged = [line for line in log_lines(off) if "Chunk written to mchunk files replaced during the write: " in line
@@ -815,24 +818,42 @@ def case_w4(off, P, skipped, n):
     files = files_of(off, ds)
     before = hook_count(off, APPEND_HOOK_LINE, ds)
     bcheck = batched(off, P, tag, n)
+    # The request's first batch waits at the lock (test_hold_write_lock) for
+    # longer than any hold so far, then fails its append: the longest hold
+    # must still take it in, although the batch returns before the counters
+    longest = (batch_counts(off) or (0, 0, 0, 0.0))[3]
+    hold_s = longest / 1000 + 1
     off.exec("touch", APPEND_MARKER)
     try:
-        st, body = off.request("PATCH", wpath(ds, W_BOX), y.tobytes())
+        held = Held(off, LOCK_MARKER, LOCK_HOOK_LINE, wpath(ds, W_BOX), y.tobytes())
+        t0 = time.monotonic()
+        if held.held:
+            time.sleep(hold_s)
+        held_ms = (time.monotonic() - t0) * 1000  # the batch holds the lock for longer than this
+        st, body = held.release()
     finally:
-        off.exec("rm", "-f", APPEND_MARKER)
+        off.exec("rm", "-f", APPEND_MARKER, LOCK_MARKER)
     if not fired(off, P, skipped, tag, APPEND_HOOK_LINE, ds, before, st, body):
         return
     d1, _ = files_of(off, ds)
     logged = [line for line in log_lines(off) if "Chunk append failed: " in line and f"/{ds}/" in line]
-    print(f"  {tag}: every append failed on purpose; PATCH {st} {body!r}; .data {len(files[0])} -> {len(d1)} B; "
-          f"log {logged}")
+    print(f"  {tag}: every append failed on purpose, the first batch held {held_ms:.0f} ms first; PATCH {st} "
+          f"{body!r}; .data {len(files[0])} -> {len(d1)} B; log {logged}")
     if (st, body) != (500, REPLACED):
         P.append(f"{tag}: PATCH answered {st} {body!r}; want 500 {REPLACED!r}")
+    if not held.held:
+        P.append(f"{tag}: the failing batch never waited at the lock hook")
     if len(d1) != len(files[0]):
         P.append(f"{tag}: .data {len(files[0])} -> {len(d1)} B; want it as it was, with no frame appended")
     if not logged:
         P.append(f"{tag}: no 'Chunk append failed: ' line for {ds}")
-    bcheck(0, 0)  # every batch of the request failed its append
+    after = bcheck(0, 0)  # every batch of the request failed its append
+    if after is not None:
+        print(f"  {tag}: longest hold of the chunk cache lock {after[3]} ms (before {longest} ms); the failing batch "
+              f"was held over {held_ms:.0f} ms")
+        if after[3] < held_ms:
+            P.append(f"{tag}: longest hold of the chunk cache lock {after[3]} ms, less than the {held_ms:.0f} ms "
+                     "a batch that then failed its append held it")
     w_check(off, P, tag, ds, files, x, y, [chunk_id(*k) for k in W_CHUNKS])
     w_after(off, P, tag, ds, y, n)
 
