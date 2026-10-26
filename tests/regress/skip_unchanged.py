@@ -944,10 +944,12 @@ def case_settings(image, platform, work, on, off, P):
 
 def case_batch_settings(image, platform, work, P, logs):
     for value, n in (("0", 0), ("abc", 0), ("65", 0), (" 64", 0), ("64", 64)):
-        data = os.path.join(work, f"batch-setting-{value}")
-        log = os.path.join(work, f"batch-setting-{value}.log")
+        # Folder and container names cannot hold the space in " 64"
+        name = value.replace(" ", "space")
+        data = os.path.join(work, f"batch-setting-{name}")
+        log = os.path.join(work, f"batch-setting-{name}.log")
         fixtures.segmentation(os.path.join(data, "a_pre"), SIZE, SIZE, harness.RES, prefill_seed=5)
-        server = harness.Server(f"batch-setting{value}", image, platform, data, {"WRITE_BATCH_CHUNKS": value})
+        server = harness.Server(f"batch-setting{name}", image, platform, data, {"WRITE_BATCH_CHUNKS": value})
         try:
             server.start()
             st, vol = read(server, "a_pre", WHOLE, SIZE[::-1])
