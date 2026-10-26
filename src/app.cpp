@@ -574,6 +574,10 @@ int main(int argc, char *argv[])
 		sample_names.reserve(archive_inventory.size());
 
 		for ( const auto &kvpair : archive_inventory ) {
+			// a dataset whose store did not open (is_valid false) has no geometry to list
+			if (kvpair.second == nullptr || !kvpair.second->is_valid) {
+				continue;
+			}
 			std::string this_name(kvpair.first);
 			sample_names.push_back(this_name);
 
