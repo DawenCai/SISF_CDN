@@ -231,7 +231,7 @@ and then compares every stored file of the later passes with the first pass
 byte for byte (except the s19 run's, whose frame order depends on timing, and
 the hook cases' layers, written only in the later passes). In passes above 0
 the `/performance` batch counters must move as the cases predict, the
-start-up line must show in both logs, and four hook cases run on the server
+start-up line must show in both logs, and five hook cases run on the server
 with the skip switch off, on a 2x2x2-chunk box whose old voxels were read
 into the cache first: an entry write that fails for one chunk
 (`/data/.test_fail_entry_write` holding the chunk number), a `.meta` close
@@ -244,14 +244,19 @@ batch that then failed). Each must answer 500, and every chunk must then
 read back as its files decode: the cache keeps no old voxels of a chunk
 whose entry reached the file, after a replacement every chunk of the layer
 reads the new files, which the write left untouched, and a request whose
-appends all fail moves no entry. The first pass also checks the `WRITE_BATCH_CHUNKS` settings "0", "abc", "65"
-and "64". CI runs it with `--batch 0,64,3` after the harness, on the release
-build and on the sanitizer build, which has the hooks and adds
+appends all fail moves no entry; and every batch taking its mchunk's header
+as unusable after its append (`/data/.test_header_unusable`, as when a reload
+found it cut short) must write no entry. The first pass also checks the
+`WRITE_BATCH_CHUNKS` settings "0", "abc", "65", " 64" (the refused value is
+logged in quotes) and "64". CI runs it with `--batch 0,64,3` after the
+harness, on the release build and on the sanitizer build, which has the
+hooks and adds
 `--require-hook`. `concurrent_patch.py` takes `--env KEY=VALUE` and
 `--resend-half` for the same s19 run on its own.
 
-`stress_d6.py` is not part of the harness; CI runs it after it (below). It stresses stale chunks in the
-chunk cache, which sit between two points inside the server and cannot be
+`stress_d6.py` is not part of the harness; CI runs it after it (below). It
+stresses stale chunks in the chunk cache, which sit between two points inside
+the server and cannot be
 triggered on demand from outside. `--mode patch`: a read that decoded a
 chunk while a PATCH replaced it putting the old chunk back into the cache;
 reader processes read one chunk without pause while a writer PATCHes it,
@@ -277,7 +282,10 @@ PATCHes of one chunk), then with `WRITE_BATCH_CHUNKS=64`: `--mode patch
 --box-edge 128` (with `--slow-batch` on the sanitizer build, which has the
 hooks), `--mode patch --box-edge 128 --fail-meta-close` (sanitizer build
 only), and `--mode rename-write --cycles 12 --sweep auto
---require-mid-write`. A run that finds no stale read means
+--require-mid-write` with `CHUNK_CACHE_LINES=70000`, so the cache holds every
+chunk of that mchunk and a stale line left by a wrong `.meta` time would be
+read. Each step removes its dataset afterwards (a 128^3 run appends about
+1.2 GB). A run that finds no stale read means
 something only if the same settings find some on a build without the fix.
 
 Compare like with like: run both images on amd64. An integer division by zero

@@ -121,9 +121,13 @@ jobs:
         timeout-minutes: 10
         working-directory: tests/regress
         run: |
+          rc=0
           python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6_b64" \
             --mode patch --writes 300 --readers 8 --box-edge 128 --env WRITE_BATCH_CHUNKS=64 \
-            ${{ matrix.sanitize == 'ON' && '--slow-batch' || '' }}
+            ${{ matrix.sanitize == 'ON' && '--slow-batch' || '' }} || rc=1
+          # About 1.2 GB of appended frames; the log stays
+          rm -rf "$RUNNER_TEMP/stress_d6_b64/d6_seg"
+          exit $rc
 
       # The same race when every batch's .meta close fails (a hook): every
       # PATCH answers 500, but its entries reached the file, so data_gen must
@@ -134,20 +138,30 @@ jobs:
         timeout-minutes: 10
         working-directory: tests/regress
         run: |
+          rc=0
           python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6_closefail_b64" \
-            --mode patch --writes 300 --readers 8 --box-edge 128 --env WRITE_BATCH_CHUNKS=64 --fail-meta-close
+            --mode patch --writes 300 --readers 8 --box-edge 128 --env WRITE_BATCH_CHUNKS=64 --fail-meta-close || rc=1
+          rm -rf "$RUNNER_TEMP/stress_d6_closefail_b64/d6_seg"
+          exit $rc
 
       # The files replaced by rename while a long batched PATCH writes, the
       # renames spread over the time one PATCH takes on this runner (measured
       # first), where a PATCH that answers 500 must leave the new files
       # untouched, and at least one rename must land during the write-back.
+      # The chunk cache holds every chunk of the mchunk (65,536 at --chunk 8),
+      # so a write that took the renamed-in .meta's time as its own would leave
+      # the previous version's lines to be read, and the run would see them.
       - name: D6 stress, files replaced during batched writes (WRITE_BATCH_CHUNKS=64)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         working-directory: tests/regress
         run: |
+          rc=0
           python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6_rw_b64" \
-            --mode rename-write --cycles 12 --sweep auto --require-mid-write --env WRITE_BATCH_CHUNKS=64
+            --mode rename-write --cycles 12 --sweep auto --require-mid-write \
+            --env WRITE_BATCH_CHUNKS=64 --env CHUNK_CACHE_LINES=70000 || rc=1
+          rm -rf "$RUNNER_TEMP/stress_d6_rw_b64/d6_rename" "$RUNNER_TEMP/stress_d6_rw_b64/versions" "$RUNNER_TEMP/stress_d6_rw_b64/stage"
+          exit $rc
 
       # SKIP_UNCHANGED_CHUNKS is off in the harness above, and none of its
       # requests resends a whole chunk unchanged, so it never reaches the skip
@@ -175,8 +189,16 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           ls regress*/candidate*.log
-          if grep -n "ERROR: AddressSanitizer" regress*/candidate*.log; then
+          # grep exits 1 for no match; 2 (a log it could not read) is not a pass
+          set +e
+          grep -n "ERROR: AddressSanitizer" regress*/candidate*.log
+          rc=$?
+          set -e
+          if [ $rc = 0 ]; then
             echo "AddressSanitizer reported an error (above)"
+            exit 1
+          elif [ $rc != 1 ]; then
+            echo "the candidate logs could not be read (grep exited $rc)"
             exit 1
           else
             echo "no AddressSanitizer reports in $(ls regress*/candidate*.log | wc -l) candidate logs"
