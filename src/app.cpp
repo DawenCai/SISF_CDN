@@ -2565,6 +2565,16 @@ int main(int argc, char *argv[])
 			avg_project
 		};
 
+		// flatfield=1 (or on/true): correct with the profiles exported next to the dataset
+		bool apply_flatfield = false;
+		for (const auto &pair : filters)
+		{
+			if (pair.first == "flatfield")
+			{
+				apply_flatfield = pair.second == "1" || pair.second == "on" || pair.second == "true";
+			}
+		}
+
 		int64_t project_frames = -1; // Number of frames to max project
 		char project_axis = 0;		 // Axis to max project along
 		projectfunction project_mode = max_project; // What projection function to use
@@ -2724,7 +2734,8 @@ int main(int argc, char *argv[])
 					y_begin_project, y_end_project,
 					z_begin_project, z_end_project,
 					strict_read ? &read_failed : nullptr,
-					channel
+					channel,
+					apply_flatfield
 				);
 			} catch (const std::exception &e) {
 				// Read failure on this dataset: fail this request only
@@ -2834,7 +2845,8 @@ int main(int argc, char *argv[])
 					y_begin, y_end,
 					z_begin, z_end,
 					strict_read ? &read_failed : nullptr,
-					channel
+					channel,
+					apply_flatfield
 				);
 			} catch (const std::exception &e) {
 				// Read failure on this dataset: fail this request only
