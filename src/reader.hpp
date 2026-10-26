@@ -1586,36 +1586,6 @@ struct region_chunk
     }
 };
 
-// One TensorStore context for all Zarr datasets. Its cache pool keeps decoded
-// chunks and shard indexes between requests (Context::Default() caches nothing).
-// Size from ZARR_CACHE_POOL_BYTES, default 1 GiB.
-inline tensorstore::Context zarr_context()
-{
-    static tensorstore::Context context = []()
-    {
-        int64_t bytes = 1LL << 30;
-        if (const char *env = std::getenv("ZARR_CACHE_POOL_BYTES"))
-        {
-            try
-            {
-                bytes = std::stoll(env);
-            }
-            catch (...)
-            {
-            }
-        }
-        auto ctx = tensorstore::Context::FromJson({{"cache_pool", {{"total_bytes_limit", bytes}}}});
-        if (!ctx.ok())
-        {
-            std::cerr << "Zarr context rejected (" << ctx.status() << "), using the default context" << std::endl;
-            return tensorstore::Context::Default();
-        }
-        std::cout << "Zarr cache pool: " << bytes << " bytes" << std::endl;
-        return *ctx;
-    }();
-    return context;
-}
-
 class archive_reader
 {
 public:
