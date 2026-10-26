@@ -258,10 +258,14 @@ def check_server(name, port, work, env, need_chunks):
 
     log = os.path.join(work, "server.log")
     with open(log, "w") as f:
-        subprocess.run(["docker", "logs", name], stdout=f, stderr=subprocess.STDOUT)
+        got = subprocess.run(["docker", "logs", name], stdout=f, stderr=subprocess.STDOUT).returncode
     with open(log, errors="replace") as f:
         asan = f.read().count("ERROR: AddressSanitizer")
-    if asan:
+    # A log that could not be read cannot show a report: that is not a pass
+    if got != 0:
+        lines.append(f"  PROBLEM docker logs exited {got}, so the server's log could not be checked ({log})")
+        problems += 1
+    elif asan:
         lines.append(f"  PROBLEM the server's log has {asan} AddressSanitizer reports ({log})")
         problems += 1
     else:

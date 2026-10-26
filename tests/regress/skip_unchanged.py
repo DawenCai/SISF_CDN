@@ -69,7 +69,7 @@ datasets). With the variable set:
   or whose append failed, is not counted (its hold still counts in H).
   Both servers log the start-up line. In pass 0 neither server shows the
   line or logs the variable.
-- w1, w2, w3, w4 (hook build, on the off server only, where every chunk
+- w1, w2, w3, w4, w5 (hook build, on the off server only, where every chunk
   covered is written): a PATCH of other contents into 8 chunks, each read
   first so the cache holds its old voxels. w1, chunk 8's entry write fails
   (/data/.test_fail_entry_write): 500, chunk 8 keeps its entry and old
@@ -92,10 +92,14 @@ datasets). With the variable set:
   500, no entry moves, .data does not grow, every chunk reads its old
   voxels as the files decode, B and C do not move while H takes in that
   wait, and the hook's and "Chunk append failed: " lines are logged. Each
-  then answers /health 200 and takes a clean PATCH.
+  then answers /health 200 and takes a clean PATCH. w5, every batch takes
+  its mchunk's header as unusable after its append
+  (/data/.test_header_unusable, as when a reload found it cut short): 500,
+  no entry moves, every chunk reads its old voxels as the files decode, and
+  B and C count the batches, which appended.
 - batch settings (pass 0, only when --batch names a value other than 0):
-  "0" is off without a log line, "abc" and "65" are off with one
-  "WRITE_BATCH_CHUNKS ignored" line, "64" logs the start-up line and writes
+  "0" is off without a log line, "abc", "65" and " 64" are off with one
+  "WRITE_BATCH_CHUNKS ignored" line naming the value in quotes, "64" logs the start-up line and writes
   a whole layer in one batch.
 
 A case that raises is recorded as a problem and the next one runs. At the
@@ -134,6 +138,7 @@ LOCK_MARKER = "/data/.test_hold_write_lock"
 BATCH_MARKER = "/data/.test_hold_in_batch"
 ENTRY_MARKER = "/data/.test_fail_entry_write"
 CLOSE_MARKER = "/data/.test_fail_meta_close"
+HEADER_MARKER = "/data/.test_header_unusable"
 APPEND_MARKER = "/data/.test_fail_append"
 SKIP_HOOK_LINE = "TEST HOOK: write held before its skip check"
 LOCK_HOOK_LINE = "TEST HOOK: write holding the chunk cache lock"
@@ -141,6 +146,7 @@ BATCH_HOOK_LINE = "TEST HOOK: batch held after its file check"
 ENTRY_HOOK_LINE = "TEST HOOK: entry write failed on purpose"
 CLOSE_HOOK_LINE = "TEST HOOK: .meta close failed on purpose"
 APPEND_HOOK_LINE = "TEST HOOK: append failed on purpose"
+HEADER_HOOK_LINE = "TEST HOOK: header taken as unusable on purpose"
 PERF = re.compile(r"<p>Chunks covered whole by writes: (\d+); left as stored because unchanged: (\d+)</p>")
 BATCH = re.compile(r"<p>Batched chunk writes \(up to (\d+) chunks per batch\): batches (\d+); chunks in them "
                    r"(\d+); longest hold of the chunk cache lock (\d+(?:\.\d+)?) ms</p>")
@@ -149,7 +155,7 @@ REPLACED = b"500 Internal Server Error -- Could not write chunk\n"
 # The w cases: a box of 2x2x2 chunks, written x slowest, z fastest (ids 0-3, 8-11)
 W_BOX = harness.box(0, 2 * C, 0, 2 * C, 0, 2 * C)
 W_CHUNKS = [(cx, cy, cz) for cx in range(2) for cy in range(2) for cz in range(2)]
-W_DATASETS = ["w1_pre", "w2_pre", "w3_pre", "w4_pre"]
+W_DATASETS = ["w1_pre", "w2_pre", "w3_pre", "w4_pre", "w5_pre"]
 # Another version of w3_pre's layer (same header, other voxels), which w3
 # renames in over it
 W3_NEW = "w3_new"
@@ -227,7 +233,8 @@ def batch_counts(server):
 
 
 def batch_startup(n):
-    return f"Chunk writes: up to {n} chunks of one mchunk per hold of the chunk cache lock (WRITE_BATCH_CHUNKS={n})"
+    return (f"Chunk writes: up to {n} {'chunk' if n == 1 else 'chunks'} of one mchunk per hold of the chunk cache "
+            f"lock (WRITE_BATCH_CHUNKS={n})")
 
 
 def batch_log(server):
@@ -858,6 +865,28 @@ def case_w4(off, P, skipped, n):
     w_after(off, P, tag, ds, y, n)
 
 
+def case_w5(off, P, skipped, n):
+    ds, tag = "w5_pre", "w5"
+    x, y = w_start(off, ds)
+    files = files_of(off, ds)
+    before = hook_count(off, HEADER_HOOK_LINE, ds)
+    bcheck = batched(off, P, tag, n)
+    off.exec("touch", HEADER_MARKER)
+    try:
+        st, body = off.request("PATCH", wpath(ds, W_BOX), y.tobytes())
+    finally:
+        off.exec("rm", "-f", HEADER_MARKER)
+    if not fired(off, P, skipped, tag, HEADER_HOOK_LINE, ds, before, st, body):
+        return
+    print(f"  {tag}: every batch took the header as unusable after its append; PATCH {st} {body!r}")
+    if (st, body) != (500, REPLACED):
+        P.append(f"{tag}: PATCH answered {st} {body!r}; want 500 {REPLACED!r}, with no entry written")
+    # The batches appended their frames before the header check, so they count
+    bcheck(nbatches(8, n), 8)
+    w_check(off, P, tag, ds, files, x, y, [chunk_id(*k) for k in W_CHUNKS])
+    w_after(off, P, tag, ds, y, n)
+
+
 def case_batch_line(on, off, P, n):
     for server in (on, off):
         tag = f"batch line ({'on' if server is on else 'off'})"
@@ -914,7 +943,7 @@ def case_settings(image, platform, work, on, off, P):
 
 
 def case_batch_settings(image, platform, work, P, logs):
-    for value, n in (("0", 0), ("abc", 0), ("65", 0), ("64", 64)):
+    for value, n in (("0", 0), ("abc", 0), ("65", 0), (" 64", 0), ("64", 64)):
         data = os.path.join(work, f"batch-setting-{value}")
         log = os.path.join(work, f"batch-setting-{value}.log")
         fixtures.segmentation(os.path.join(data, "a_pre"), SIZE, SIZE, harness.RES, prefill_seed=5)
@@ -938,7 +967,7 @@ def case_batch_settings(image, platform, work, P, logs):
         if n:
             want = [batch_startup(n)]
         elif value != "0":
-            want = [f"WRITE_BATCH_CHUNKS ignored (not a whole number from 0 to 64): {value}; writes are not batched"]
+            want = [f"WRITE_BATCH_CHUNKS ignored (not a whole number from 0 to 64): '{value}'; writes are not batched"]
         else:
             want = []
         if lines != want:
@@ -1057,6 +1086,7 @@ def run_pass(args, root, n, batching, P, skipped, logs):
             ("w2", lambda: case_w2(off, Pp, sk, n)),
             ("w3", lambda: case_w3(off, Pp, sk, n)),
             ("w4", lambda: case_w4(off, Pp, sk, n)),
+            ("w5", lambda: case_w5(off, Pp, sk, n)),
         ]
     cases.append(("batch line", lambda: case_batch_line(on, off, Pp, n)))
     if not n:
