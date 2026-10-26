@@ -18,8 +18,11 @@ RUN cd zstd; make -j $BUILD_THREAD; cd ..
 RUN cd ffmpeg_HDF5_filter; cmake .; make -j $BUILD_THREAD; cd ..
 
 # SANITIZE=ON builds the server with ASan + UBSan (see CMakeLists.txt).
+# TEST_HOOKS=ON adds the test-only hooks tests/regress uses (never in an image
+# that is published).
 ARG SANITIZE=OFF
-RUN cmake -DNTRACER_SANITIZE=$SANITIZE .; exit 0
+ARG TEST_HOOKS=OFF
+RUN cmake -DNTRACER_SANITIZE=$SANITIZE -DNTRACER_TEST_HOOKS=$TEST_HOOKS .; exit 0
 RUN make -j $BUILD_THREAD
 
 # Runtime image: only the binary, the two in-tree shared libraries it loads
