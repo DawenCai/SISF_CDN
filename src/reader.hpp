@@ -23,6 +23,8 @@ Licensed under the terms specified in LICENSE.md
 #include <queue>
 #include <deque>
 #include <mutex>
+#include <memory>
+#include <filesystem>
 #include <atomic>
 #include <map>
 #include <unordered_map>
@@ -38,6 +40,8 @@ Licensed under the terms specified in LICENSE.md
 #include <nlohmann/json.hpp>
 
 #include "vidlib.hpp"
+#include "flatfield.hpp"
+#include "flatfield_store.hpp"
 
 #include "../zstd/lib/zstd.h"
 
@@ -1973,6 +1977,41 @@ public:
     std::string metadata_fname;
     int64_t metadata_mtime_ns = 0;
 
+    // Optional flat-field profiles exported next to the dataset (see flatfield.hpp).
+    // Reloaded when .flatfield/model.json appears or changes, so an export made
+    // while the CDN runs takes effect without a restart (checked at most once a second).
+    std::shared_ptr<FlatfieldModel> flatfield;
+    std::mutex flatfield_mutex;
+    std::filesystem::file_time_type flatfield_mtime{};
+    bool flatfield_seen = false;
+    std::chrono::steady_clock::time_point flatfield_checked{};
+
+    std::shared_ptr<FlatfieldModel> current_flatfield()
+    {
+        if (type != SISF)
+            return nullptr;
+        std::lock_guard<std::mutex> lock(flatfield_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (flatfield_seen && now - flatfield_checked < std::chrono::seconds(1))
+            return flatfield;
+        flatfield_checked = now;
+        std::error_code ec;
+        const auto mtime = std::filesystem::last_write_time(fname + "/.flatfield/model.json", ec);
+        if (ec)
+        {
+            flatfield.reset(); // export removed (or never made)
+            flatfield_seen = true;
+            return flatfield;
+        }
+        if (!flatfield_seen || mtime != flatfield_mtime || !flatfield)
+        {
+            flatfield.reset(FlatfieldModel::load(fname));
+            flatfield_mtime = mtime;
+        }
+        flatfield_seen = true;
+        return flatfield;
+    }
+
     std::unordered_map<std::string, archive_reader *> *parent_archive_inventory;
 
     archive_reader(std::string name_in, enum ArchiveType type_in, std::unordered_map<std::string, archive_reader *> *par_in = nullptr)
@@ -2003,6 +2042,8 @@ public:
         }
 
         load_protection();
+
+        current_flatfield();
     }
 
     ~archive_reader() {}
@@ -2810,9 +2851,14 @@ public:
         size_t ys, size_t ye,
         size_t zs, size_t ze,
         bool *failed = nullptr,
-        int64_t channel = -1)
+        int64_t channel = -1,
+        bool apply_flatfield = false)
     {
         std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+
+        // Flat-field (see flatfield.hpp), held for the whole request so a reload cannot free it
+        std::shared_ptr<FlatfieldModel> ff_hold = apply_flatfield ? current_flatfield() : nullptr;
+        FlatfieldModel *ff = ff_hold.get();
 
         const size_t c0 = channel < 0 ? 0 : (size_t)channel;
         const size_t c1 = channel < 0 ? channel_count : (size_t)channel + 1;
@@ -2884,6 +2930,48 @@ public:
 
                 load_region_by_chunk(shards, xs, xe, ys, ye, zs, ze, mcx, mcy, mcz, c0, out_buffer,
                                      read_failed, outside_voxels);
+
+                // Flat-field on each voxel's position inside its shard (the shard holds the
+                // camera's field of view; its stored extent at this level is the plane's frame)
+                if (ff != nullptr)
+                {
+                    std::shared_ptr<const FlatfieldModel::Plane> pl;
+                    size_t pl_c = SIZE_MAX, pl_w = 0, pl_h = 0;
+                    for (const region_shard &sh : shards)
+                    {
+                        if (sh.reader == nullptr || !sh.reader->is_valid)
+                            continue;
+                        const size_t fw = sh.reader->sizex, fh = sh.reader->sizey;
+                        if (sh.c != pl_c || fw != pl_w || fh != pl_h)
+                        {
+                            pl_c = sh.c;
+                            pl_w = fw;
+                            pl_h = fh;
+                            pl = ff->plane(sh.c, fw, fh);
+                        }
+                        if (!pl)
+                            continue;
+                        const size_t bx = sh.mi * mcx, by = sh.mj * mcy, bz = sh.mk * mcz;
+                        const size_t x0 = std::max(xs, bx), x1 = std::min(xe, bx + mcx);
+                        const size_t y0 = std::max(ys, by), y1 = std::min(ye, by + mcy);
+                        const size_t z0 = std::max(zs, bz), z1 = std::min(ze, bz + mcz);
+                        for (size_t k = z0; k < z1; k++)
+                            for (size_t j = y0; j < y1; j++)
+                            {
+                                const size_t yl = j - by + sh.reader->cropstarty;
+                                if (yl >= fh)
+                                    continue;
+                                uint16_t *row = out_buffer + ((sh.c - c0) * osizey * osizex * osizez) +
+                                                ((k - zs) * osizey * osizex) + ((j - ys) * osizex);
+                                for (size_t i = x0; i < x1; i++)
+                                {
+                                    const size_t xl = i - bx + sh.reader->cropstartx;
+                                    if (xl < fw)
+                                        row[i - xs] = FlatfieldModel::apply(*pl, yl * fw + xl, row[i - xs]);
+                                }
+                            }
+                    }
+                }
             }
 
             std::string note;
