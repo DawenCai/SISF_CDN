@@ -186,16 +186,26 @@ jobs:
           grep -h "runtime error:" regress*/candidate*.log stress_d6*/server.log | sed -E 's/^[^ ]*\/src\///; s/value [0-9]+/value N/' | sort | uniq -c | sort -rn | head -20 || true
 
       # The test hooks are compiled only into the sanitizer build; the release
-      # build, the one published, must carry none of them.
-      - name: No test hooks in the release build
-        if: ${{ !cancelled() && matrix.sanitize == 'OFF' }}
+      # build, the one published, must carry none of them. The sanitizer
+      # build must carry them, which shows the check can find them. Any other
+      # outcome (no image, no binary, no grep) fails too.
+      - name: Test hooks only in the sanitizer build
+        if: ${{ !cancelled() }}
         run: |
-          if docker run --rm --pull never --entrypoint grep sisf_cdn:candidate -c -a "TEST HOOK" /app/nTracer_cdn; then
-            echo "the release build has test hooks (count above)"
+          set +e
+          docker run --rm --pull never --entrypoint grep sisf_cdn:candidate -c -a "TEST HOOK" /app/nTracer_cdn
+          rc=$?
+          set -e
+          want=${{ matrix.sanitize == 'ON' && '0' || '1' }}
+          case $rc in
+            0|1) ;;
+            *) echo "the check could not run (grep or docker exited $rc)"; exit 1 ;;
+          esac
+          if [ "$rc" != "$want" ]; then
+            echo "test hooks $([ $rc = 0 ] && echo found || echo not found) in the sanitize=${{ matrix.sanitize }} build"
             exit 1
-          else
-            echo "no test hooks in the release build"
           fi
+          echo "test hooks $([ $rc = 0 ] && echo found || echo not found), as expected for sanitize=${{ matrix.sanitize }}"
 
       - name: Keep the reports
         if: always()

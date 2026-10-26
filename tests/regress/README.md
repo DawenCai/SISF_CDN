@@ -238,12 +238,13 @@ into the cache first: an entry write that fails for one chunk
 that fails (`/data/.test_fail_meta_close`), the mchunk's files replaced by
 another version of the layer while a batch waits after its file check
 (`/data/.test_hold_in_batch`; `/health` must report the held batch as a
-write), and an append that fails (`/data/.test_fail_append`). Each must
-answer 500, and every chunk must then read back as its files decode: the
-cache keeps no old voxels of a chunk whose entry reached the file, after a
-replacement every chunk of the layer reads the new files, which the write
-left untouched, and a failed append moves no entry. The first pass also
-checks the `WRITE_BATCH_CHUNKS` settings "0", "abc", "65"
+write), and every append of the request failing (`/data/.test_fail_append`,
+the first batch held at the lock first, so the longest hold must take in a
+batch that then failed). Each must answer 500, and every chunk must then
+read back as its files decode: the cache keeps no old voxels of a chunk
+whose entry reached the file, after a replacement every chunk of the layer
+reads the new files, which the write left untouched, and a request whose
+appends all fail moves no entry. The first pass also checks the `WRITE_BATCH_CHUNKS` settings "0", "abc", "65"
 and "64". CI runs it with `--batch 0,64,3` after the harness, on the release
 build and on the sanitizer build, which has the hooks and adds
 `--require-hook`. `concurrent_patch.py` takes `--env KEY=VALUE` and
