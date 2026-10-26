@@ -278,6 +278,19 @@ bool test_fail_append(const std::string &data_fname)
     return true;
 }
 
+// Test-only, as above: while <data path>/.test_header_unusable exists, a batch
+// takes its mchunk's header as unusable after its append (as when a reload
+// found the header cut short meanwhile), so it writes no entry.
+bool test_header_unusable(const std::string &meta_fname)
+{
+    if (access((DATA_PATH + ".test_header_unusable").c_str(), F_OK) != 0)
+    {
+        return false;
+    }
+    std::cerr << "TEST HOOK: header taken as unusable on purpose: " << meta_fname << std::endl;
+    return true;
+}
+
 // Test-only, as above: while <data path>/.test_slow_batch exists, a batch waits
 // 5 ms holding the chunk cache lock after its append, before it writes any
 // entry. The .meta is not yet changed then, so reads go on without reloading
@@ -1589,8 +1602,9 @@ public:
         {
             return true;
         }
-        const std::string which = " chunks " + std::to_string(batch.front().id) + ".." + std::to_string(batch.back().id) +
-                                  " (" + std::to_string(batch.size()) + " in one batch)";
+        // A batch's chunks are in write order but rarely consecutive numbers
+        const std::string which = ": a batch of " + std::to_string(batch.size()) + " chunks, from chunk " +
+                                  std::to_string(batch.front().id) + " to chunk " + std::to_string(batch.back().id);
 
         // Compress every chunk into one buffer, in batch order, outside the lock
         size_t bound = 0;
@@ -1695,7 +1709,14 @@ public:
                 return false;
             }
 
-            if (!is_valid)
+            bool header_usable = is_valid;
+#ifdef NTRACER_TEST_HOOKS
+            if (header_usable && test_header_unusable(meta_fname))
+            {
+                header_usable = false;
+            }
+#endif
+            if (!header_usable)
             {
                 // The header could not be read, so where the entries are is unknown
                 entries_written = false;

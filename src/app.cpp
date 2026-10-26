@@ -363,14 +363,15 @@ int main(int argc, char *argv[])
 		}
 		else
 		{
+			// Quoted, so a value with spaces shows why it was refused
 			std::cerr << "WRITE_BATCH_CHUNKS ignored (not a whole number from 0 to " << WRITE_BATCH_CHUNKS_MAX
-					  << "): " << write_batch_chunks << "; writes are not batched" << std::endl;
+					  << "): '" << write_batch_chunks << "'; writes are not batched" << std::endl;
 		}
 	}
 	if (WRITE_BATCH_CHUNKS > 0)
 	{
-		std::cout << "Chunk writes: up to " << WRITE_BATCH_CHUNKS
-				  << " chunks of one mchunk per hold of the chunk cache lock (WRITE_BATCH_CHUNKS=" << WRITE_BATCH_CHUNKS << ")"
+		std::cout << "Chunk writes: up to " << WRITE_BATCH_CHUNKS << (WRITE_BATCH_CHUNKS == 1 ? " chunk" : " chunks")
+				  << " of one mchunk per hold of the chunk cache lock (WRITE_BATCH_CHUNKS=" << WRITE_BATCH_CHUNKS << ")"
 				  << std::endl;
 	}
 
