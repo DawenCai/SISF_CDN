@@ -2140,7 +2140,7 @@ int main(int argc, char *argv[])
 										   (i - x_begin);									   // X
 
 					// load_chunk reloads the header when the .meta changed on disk, so the
-					// geometry is read again for every voxel (as load_region does), and a
+					// geometry is read again for every voxel, and a
 					// chunk buffer is only indexed with the extent it was loaded with
 					const size_t cx = chunk_reader->chunkx;
 					const size_t cy = chunk_reader->chunky;
