@@ -185,6 +185,15 @@ def plane(out, size_xy, res, seed):
         create_shard(f"{out}/data/{name}.data", f"{out}/meta/{name}.meta", cur, tuple(min(d, 32) for d in cur.shape))
 
 
+def descriptor(out, layers, res):
+    """A descriptor dataset: only a descriptor.json, which places layers of
+    other datasets in one volume. Each layer is a dict with source,
+    source_channel, target_channel, source_size and target_offset (x, y, z)."""
+    os.makedirs(out, exist_ok=True)
+    with open(f"{out}/descriptor.json", "w") as f:
+        json.dump({"xres": res[0], "yres": res[1], "zres": res[2], "layers": layers}, f)
+
+
 def pointclouds(parent, size):
     d = f"{parent}/pointclouds"
     os.makedirs(d, exist_ok=True)

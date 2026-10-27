@@ -174,6 +174,17 @@ baseline first. A missing image fails the run instead of being fetched.
     `/info` (`viewer_overreach`, the viewer's prefetch arithmetic): none may
     wrap, and the empty boxes must answer 200 with no body; and PATCHes of
     the last plane of each axis of levels 2, 4 and 8 of the layer, read back.
+  - s25: a descriptor dataset (only a `descriptor.json`) with one layer, all
+    of an untiled 40 x 30 x 20 image placed at target offset (-2, -4, -6).
+    The descriptor's origin is the smallest offset on each axis (0 where
+    none is negative), so the layer starts at 0 on every axis and the
+    descriptor must read as its source. The CDN used to take the layer's z
+    start from the y origin, so the layer stopped two planes short and the
+    last two planes read as zeros. Records: the source's own full read
+    against the fixture (the control, alike on both servers), the
+    descriptor's `/info`, and its full read and its last plane against the
+    fixture, each as the number of voxels that differ and the planes that
+    read as all zeros.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
@@ -193,7 +204,9 @@ baseline first. A missing image fails the run instead of being fetched.
 
 `--candidate-env KEY=VALUE` (repeatable) starts the candidate with that
 environment variable, e.g. `CHUNK_CACHE_LINES=4096` to check that a larger
-chunk cache changes no answer.
+chunk cache changes no answer. CI runs the harness a second and third time
+with `WRITE_BATCH_CHUNKS=64` and `=5`: batched chunk writes must store the
+same bytes and give the same answers, so the allow file is the same.
 
 `health.py --image IMAGE --work DIR [--lock-ms 700] [--runs N] [--require-hook]`
 checks `/health` on one image, without a baseline: 200 `ok lock_wait_ms=N`
@@ -202,11 +215,12 @@ they were; `HEALTH_LOCK_MS` taken, or ignored with one log line; and, while
 a write is held inside the chunk cache lock, 503 `stuck lock_wait_ms=N
 write_held_ms=M` within `HEALTH_LOCK_MS` + 0.5 s with no request thread left
 waiting, then 200 again once the write goes through. Holding the write
-needs a build made with `-DNTRACER_TEST_HOOKS=ON` (a write then waits while
-`/data/.test_hold_write_lock` exists); on any other build that part is
-reported as SKIPPED, and `--require-hook` makes that a failure.
+needs a build made with `-DNTRACER_TEST_HOOKS=ON` (`docker build --build-arg
+TEST_HOOKS=ON`; a write then waits while `/data/.test_hold_write_lock`
+exists); on any other build that part is reported as SKIPPED, and
+`--require-hook` makes that a failure.
 
-`skip_unchanged.py --image IMAGE --work DIR [--rounds 40] [--require-hook]`
+`skip_unchanged.py --image IMAGE --work DIR [--rounds 40] [--require-hook] [--batch 0,64,3]`
 checks `SKIP_UNCHANGED_CHUNKS=1` on one image, without a baseline, against a
 server of the same image with the switch off: a PATCH of exactly what a layer
 holds appends nothing (off: every chunk covered whole is appended again); one
@@ -222,20 +236,67 @@ files, in between: the held PATCH must still land, or answer 500 for the
 replaced files, as without the switch; and `/health` must report a skip check
 held inside the chunk cache lock (`/data/.test_hold_write_lock`) as a write.
 Without the hook those cases are SKIPPED, and `--require-hook` makes that a
-failure. CI runs it without `--require-hook` on the release and the sanitizer
-build after the harness. `concurrent_patch.py` takes `--env KEY=VALUE` and
+failure. `--batch 0,64,3` runs every case once per `WRITE_BATCH_CHUNKS`
+value, 0 (not batched) first, each pass on fresh data and its own servers,
+and then compares every stored file of the later passes with the first pass
+byte for byte (except the s19 run's, whose frame order depends on timing, and
+the hook cases' layers, written only in the later passes). In passes above 0
+the `/performance` batch counters must move as the cases predict, the
+start-up line must show in both logs, and five hook cases run on the server
+with the skip switch off, on a 2x2x2-chunk box whose old voxels were read
+into the cache first: an entry write that fails for one chunk
+(`/data/.test_fail_entry_write` holding the chunk number), a `.meta` close
+that fails (`/data/.test_fail_meta_close`), the mchunk's files replaced by
+another version of the layer while a batch waits after its file check
+(`/data/.test_hold_in_batch`; `/health` must report the held batch as a
+write), and every append of the request failing (`/data/.test_fail_append`,
+the first batch held at the lock first, so the longest hold must take in a
+batch that then failed). Each must answer 500, and every chunk must then
+read back as its files decode: the cache keeps no old voxels of a chunk
+whose entry reached the file, after a replacement every chunk of the layer
+reads the new files, which the write left untouched, and a request whose
+appends all fail moves no entry; and every batch taking its mchunk's header
+as unusable after its append (`/data/.test_header_unusable`, as when a reload
+found it cut short) must write no entry. The first pass also checks the
+`WRITE_BATCH_CHUNKS` settings "0", "abc", "65", " 64" (the refused value is
+logged in quotes) and "64". CI runs it with `--batch 0,64,3` after the
+harness, on the release build and on the sanitizer build, which has the
+hooks and adds
+`--require-hook`. `concurrent_patch.py` takes `--env KEY=VALUE` and
 `--resend-half` for the same s19 run on its own.
 
-`stress_d6.py` is not part of the harness; CI runs `--mode patch` once (300
-PATCHes) on the candidate after it. It stresses stale chunks in the
-chunk cache, which sit between two points inside the server and cannot be
+`stress_d6.py` is not part of the harness; CI runs it after it (below). It
+stresses stale chunks in the chunk cache, which sit between two points inside
+the server and cannot be
 triggered on demand from outside. `--mode patch`: a read that decoded a
 chunk while a PATCH replaced it putting the old chunk back into the cache;
 reader processes read one chunk without pause while a writer PATCHes it,
-and after each PATCH the chunk is read again. `--mode rename`: s15's
+and after each PATCH the chunk is read again. `--box-edge 128` makes the box
+128^3 (64 chunks, every one checked). `--slow-batch` (a build with the test
+hooks, `WRITE_BATCH_CHUNKS` set) makes each batch wait 5 ms after its append
+and before its entries (`/data/.test_slow_batch`), while reads go on without
+reloading the unchanged `.meta`: a batch that bumped `data_gen` before its
+entries then lets reads put old chunks back. `--fail-meta-close` (the same
+build and setting) makes every batch's `.meta` close fail
+(`/data/.test_fail_meta_close`): every PATCH must answer 500, and every chunk
+read after it must still be the new one, since its entries reached the file
+and the batch must still bump `data_gen`. `--mode rename`: s15's
 sequence, repeated, reporting how many cycles landed. `--mode
 rename-write`: the files replaced at a later point in each cycle of a long
-PATCH, then every voxel checked. A run that finds no stale read means
+PATCH, then every voxel checked; a PATCH that answered 500 must have left the
+new files untouched. `--sweep auto` times one PATCH first and spreads the
+renames over that time; `--require-mid-write` fails the run when no rename
+landed during a PATCH's write-back. `--env KEY=VALUE` starts the server with
+that variable; with `WRITE_BATCH_CHUNKS` set, `/performance` must show the
+batch counters, and without it must not. CI runs `--mode patch` (300
+PATCHes of one chunk), then with `WRITE_BATCH_CHUNKS=64`: `--mode patch
+--box-edge 128` (with `--slow-batch` on the sanitizer build, which has the
+hooks), `--mode patch --box-edge 128 --fail-meta-close` (sanitizer build
+only), and `--mode rename-write --cycles 12 --sweep auto
+--require-mid-write` with `CHUNK_CACHE_LINES=70000`, so the cache holds every
+chunk of that mchunk and a stale line left by a wrong `.meta` time would be
+read. Each step removes its dataset afterwards (a 128^3 run appends about
+1.2 GB). A run that finds no stale read means
 something only if the same settings find some on a build without the fix.
 
 Compare like with like: run both images on amd64. An integer division by zero
