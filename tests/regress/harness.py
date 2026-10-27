@@ -1788,6 +1788,90 @@ def sc_descriptor_origin(server, results, sid):
         *server.request("GET", f"/{S25_DESCRIPTOR}/1/" + box(0, 40, 0, 30, 19, 20)), want[19:], 19)
 
 
+S26_DATASET = "sc_crop"
+# Tile (1,0,0)'s crop start at 1X: as built, after one move, then moves A and B
+S26_START, S26_MOVE, S26_A, S26_B = (12, 12), (14, 13), (16, 14), (18, 15)
+
+
+def _crop_want(keep, start, x0, x1, y0, y1):
+    """The plane z 0 of the box x0-x1, y0-y1 (inside tile row 0, step 72) of
+    a 1-channel tiled fixture, with tile (1,0,0)'s 1X crop start at start
+    and every other tile's as built, as [z, y, x]."""
+    want = np.zeros((1, y1 - y0, x1 - x0), dtype=np.uint16)
+    for tx in range(x0 // 72, (x1 - 1) // 72 + 1):
+        tile, crop = keep[(0, tx, 0, 0, 1)]
+        sx, sy = start if tx == 1 else (crop[0], crop[2])
+        a, b = max(x0, 72 * tx), min(x1, 72 * tx + 72)
+        want[0, :, a - x0:b - x0] = tile[a - 72 * tx + sx:b - 72 * tx + sx, y0 + sy:y1 + sy, 0].T
+    return want
+
+
+def _move_tile_crop(server, ds, headers, start):
+    """The portal's update_single_tile_crop on tile (1,0,0): each level's
+    86-byte .meta header is rewritten in place with the 1X crop start divided
+    by the level's factor and the window's size kept. headers holds each
+    level's header as built. The write is made inside the container, as the
+    portal's backend container makes it: on Docker Desktop a write made on
+    this side can reach the container's stat() late."""
+    for fn, v in sorted(headers.items()):
+        f_ = int(fn.split(".")[-2].rstrip("X"))
+        v = list(v)
+        w, h = v[11] - v[10], v[13] - v[12]
+        v[10], v[12] = start[0] // f_, start[1] // f_
+        v[11], v[13] = v[10] + w, v[12] + h
+        subprocess.run(["docker", "exec", "-i", server.name, "dd", f"of=/data/{ds}/meta/{fn}", "bs=86", "count=1",
+                        "conv=notrunc", "status=none"],
+                       input=struct.pack(fixtures.SHARD_HEADER_LAYOUT, *v), check=True, capture_output=True)
+
+
+def sc_crop_moved(server, results, sid):
+    """BUG-187: an alignment moves a served tile's crop window in place, and
+    the box over it is read at once. The first read after a move must
+    already be the new picture; production and the fork before this change
+    placed the first voxel of the moved mchunk with the old crop start (the
+    header was reloaded inside that voxel's own chunk load). Then two moves
+    in one wall-clock second with a read between: production compared .meta
+    mtimes in whole seconds and kept serving move A after move B. Every read
+    is checked against the fixture."""
+    ds = S26_DATASET
+    root = os.path.join(server.data_dir, ds)
+    keep = {}
+    fixtures.tiled(root, 1, (3, 2, 1), (96, 96, 1), (24, 24, 0), RES, 26, keep=keep)  # step 72, crop start 12
+    headers = {}
+    for fn in os.listdir(os.path.join(root, "meta")):
+        if fn.startswith("chunk_1_0_0."):
+            with open(os.path.join(root, "meta", fn), "rb") as f:
+                headers[fn] = struct.unpack(fixtures.SHARD_HEADER_LAYOUT, f.read(86))
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            _wait_visible(server, os.path.relpath(os.path.join(dirpath, f), server.data_dir))
+    b = box(36, 144, 0, 72, 0, 1)  # the right half of tile (0,0,0) and all of tile (1,0,0)
+
+    def check(tag, start):
+        results[f"{sid}: {tag}"] = _voxel_check(*server.request("GET", f"/{ds}/1/{b}"),
+                                                _crop_want(keep, start, 36, 144, 0, 72), 0)
+
+    check("read before", S26_START)
+    time.sleep(1.2)  # production compares .meta mtimes in whole seconds
+    _move_tile_crop(server, ds, headers, S26_MOVE)
+    check("first read after a move", S26_MOVE)
+    check("second read after a move", S26_MOVE)
+    time.sleep(1.2)
+    while time.time() % 1 > 0.2:
+        time.sleep(0.01)
+    t0 = time.time()
+    _move_tile_crop(server, ds, headers, S26_A)
+    check("read after move A", S26_A)
+    _move_tile_crop(server, ds, headers, S26_B)
+    t1 = time.time()
+    check("read after move B, made in the same second as A", S26_B)
+    time.sleep(3)
+    check("read 3 s after move B", S26_B)
+    # Moves A and B count as one second only if both writes fell inside it
+    results[f"{sid}: moves A and B in one second"] = {"status": "info", "len": None, "sha256": None,
+                                                      "text": "yes" if int(t0) == int(t1) else "no"}
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
 # s7 runs last: production dies in it, and nothing should depend on a server
@@ -1816,6 +1900,7 @@ SCENARIOS = [
     ("s23 raw_access unfilled part", sc_raw_access_unfilled),
     ("s24 one-mchunk levels", sc_one_mchunk_levels),
     ("s25 descriptor layer origins", sc_descriptor_origin),
+    ("s26 tile crop moved while served", sc_crop_moved),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
 # sc_cpatch (s19) is not here: where its frames land in the .data depends on
@@ -1825,7 +1910,7 @@ SCENARIOS = [
 # is s22's: production writes the PATCHes the fork refuses, so s22 checks its
 # files itself.
 SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short", "sc_strict", "sc_regrow", "sc_regrow_w",
-                     "sc_cold", "sc_video", "sc_ka_image", "sc_ka_labels", "sc_rename"]
+                     "sc_cold", "sc_video", "sc_ka_image", "sc_ka_labels", "sc_rename", S26_DATASET]
 
 
 def run_scenarios(server, results):

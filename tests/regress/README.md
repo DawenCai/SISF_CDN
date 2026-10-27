@@ -185,6 +185,16 @@ baseline first. A missing image fails the run instead of being fetched.
     descriptor's `/info`, and its full read and its last plane against the
     fixture, each as the number of voxels that differ and the planes that
     read as all zeros.
+  - s26: a served tile's crop window moved in place, as an alignment moves
+    it (each level's 86-byte header rewritten with `dd conv=notrunc` inside
+    the container, as the portal's backend container writes it), and the
+    box over it read at once. The first read after a move must already be
+    the new picture: the CDN used to place the moved mchunk's first voxel
+    with the old crop start and reload the header inside that voxel's chunk
+    load. Then two moves in one wall-clock second with a read between, and
+    a read 3 s later: production compared `.meta` mtimes in whole seconds
+    and kept serving the first of the two. Every read is checked against
+    the fixture; the record also says whether both moves fell in one second.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
