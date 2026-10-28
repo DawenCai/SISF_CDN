@@ -985,14 +985,6 @@ public:
         return g;
     }
 
-    // True if the .meta changed on disk since the header was last read.
-    // Unlike check_mtime_hasmodified it records nothing, so the next
-    // reload_if_modified still sees the change.
-    bool meta_changed_on_disk() const
-    {
-        return get_file_mtime_ns(meta_fname) != last_meta_read_time;
-    }
-
     // load_meta_entry for a request that took g from this reader: the entry
     // is read through files, and the header is not checked again (the
     // request checked it once, before it took g)
@@ -2722,8 +2714,8 @@ public:
     // Reads the box one chunk at a time: each chunk it touches is decoded
     // once and the part it covers copied a row at a time. Each mchunk's
     // header is taken once (after a retry if its last reload failed) and
-    // its files are opened once for the request. Used when no header changed
-    // on disk since it was last read; see load_region_by_voxel.
+    // its files are opened once for the request. load_region has already
+    // read again any header that changed on disk since it was last read.
     void load_region_by_chunk(
         std::vector<region_shard> &shards,
         size_t xs, size_t xe,
@@ -2804,248 +2796,6 @@ public:
         }
     }
 
-    // The voxel loop this CDN has always run, one voxel at a time, looking
-    // the mchunk and chunk up again whenever either changes. load_region uses
-    // it only when an mchunk header changed on disk since it was last read:
-    // the loop reloads that header inside the mchunk's first chunk load and
-    // reads the rest of the mchunk with the new header, and a stale-geometry
-    // read keeps exactly the answer it had. back_mchunks holds the mchunks
-    // for which no reader could be built.
-    void load_region_by_voxel(
-        size_t scale,
-        size_t xs, size_t xe,
-        size_t ys, size_t ye,
-        size_t zs, size_t ze,
-        size_t c0, size_t c1,
-        uint16_t *out_buffer,
-        std::set<std::tuple<size_t, size_t, size_t, size_t, size_t>> &back_mchunks,
-        bool &failed,
-        size_t &outside_voxels,
-        size_t &stale_voxels)
-    {
-        const size_t osizex = xe - xs;
-        const size_t osizey = ye - ys;
-        const size_t osizez = ze - zs;
-
-        // Define map for storing already decompressed chunks
-        std::map<std::tuple<size_t, size_t, size_t, size_t, size_t>, region_chunk> chunk_cache;
-
-        // Scaled metachunk size — clamp to >=1
-        const size_t mcx = std::max<size_t>(1, mchunkx / scale);
-        const size_t mcy = std::max<size_t>(1, mchunky / scale);
-        const size_t mcz = std::max<size_t>(1, mchunkz / scale);
-
-        // Variables to store chunk reader and data (shared in loop)
-        packed_reader *chunk_reader = nullptr;
-        std::tuple<size_t, size_t, size_t, size_t, size_t> *chunk_identifier = nullptr;
-        size_t sub_chunk_id;
-        uint16_t *chunk;
-
-        // Variables for tracking the last chunks that were used
-        size_t last_x, last_y, last_z, last_sub, last_c;
-        size_t cxmin, cxmax, cxsize;
-        size_t cymin, cymax, cysize;
-        size_t czmin, czmax, czsize;
-
-        for (size_t c = c0; c < c1; c++)
-        {
-            for (size_t i = xs; i < xe; i++)
-            {
-                const size_t xmin = mcx * (i / mcx);                             // lower bound of mchunk
-                const size_t xmax = std::min((size_t)xmin + mcx, (size_t)sizex); // upper bound of mchunk
-                const size_t xsize = xmax - xmin;                                // size of mchunk
-                const size_t chunk_id_x = i / ((size_t)mcx);                     // mchunk x id
-                const size_t x_in_chunk = i - xmin;                              // x displacement inside chunk
-
-                for (size_t j = ys; j < ye; j++)
-                {
-                    const size_t ymin = mcy * (j / mcy);
-                    const size_t ymax = std::min((size_t)ymin + mcy, (size_t)sizey);
-                    const size_t ysize = ymax - ymin;
-                    const size_t chunk_id_y = j / ((size_t)mcy);
-                    const size_t y_in_chunk = j - ymin;
-
-                    for (size_t k = zs; k < ze; k++)
-                    {
-                        const size_t zmin = mcz * (k / mcz);
-                        const size_t zmax = std::min((size_t)zmin + mcz, (size_t)sizez);
-                        const size_t zsize = zmax - zmin;
-                        const size_t chunk_id_z = k / ((size_t)mcz);
-                        const size_t z_in_chunk = k - zmin;
-
-                        bool force = false;
-                        if (chunk_reader == nullptr ||
-                            chunk_identifier == nullptr ||
-                            last_x != chunk_id_x ||
-                            last_y != chunk_id_y ||
-                            last_z != chunk_id_z ||
-                            last_c != c)
-                        {
-                            force = true;
-
-                            bool is_bad = back_mchunks.count({scale, c, chunk_id_x, chunk_id_y, chunk_id_z}) > 0;
-
-                            if (!is_bad)
-                            {
-                                chunk_reader = get_mchunk(scale, c, chunk_id_x, chunk_id_y, chunk_id_z);
-                            }
-                            else
-                            {
-                                chunk_reader = nullptr;
-                            }
-
-                            if (chunk_reader == nullptr || chunk_reader == 0)
-                            {
-                                // No reader could be built: the .meta is missing, cannot be
-                                // opened or has an unusable header
-                                failed = true;
-                                if (!is_bad)
-                                {
-                                    back_mchunks.insert({scale, c, chunk_id_x, chunk_id_y, chunk_id_z});
-                                }
-                                continue;
-                            }
-
-                            if (!chunk_reader->is_valid)
-                            {
-                                // Its last reload failed; retry if the file changed since
-                                chunk_reader->reload_if_modified();
-                            }
-
-                            last_x = chunk_id_x;
-                            last_y = chunk_id_y;
-                            last_z = chunk_id_z;
-                        }
-
-                        if (!chunk_reader->is_valid)
-                        {
-                            // The mchunk's header could not be read on a reload, so its
-                            // geometry is unknown: its voxels read as 0
-                            failed = true;
-                            back_mchunks.insert({scale, c, chunk_id_x, chunk_id_y, chunk_id_z});
-                            chunk_reader = nullptr;
-                            continue;
-                        }
-
-                        // Shift ranges for cropping
-                        const size_t x_in_chunk_offset = x_in_chunk + chunk_reader->cropstartx;
-                        const size_t y_in_chunk_offset = y_in_chunk + chunk_reader->cropstarty;
-                        const size_t z_in_chunk_offset = z_in_chunk + chunk_reader->cropstartz;
-
-                        // Outside the stored tile, e.g. when the archive geometry is stale after
-                        // an in-place re-conversion. find_index would name a chunk that is not this one.
-                        if (x_in_chunk_offset >= chunk_reader->sizex ||
-                            y_in_chunk_offset >= chunk_reader->sizey ||
-                            z_in_chunk_offset >= chunk_reader->sizez)
-                        {
-                            outside_voxels++;
-                            if (force && chunk_identifier != nullptr)
-                            {
-                                // Make the next voxel start over; the cached chunk belongs to the previous mchunk
-                                delete chunk_identifier;
-                                chunk_identifier = nullptr;
-                            }
-                            continue;
-                        }
-
-                        // Find sub chunk id from coordinates
-                        sub_chunk_id = chunk_reader->find_index(x_in_chunk_offset, y_in_chunk_offset, z_in_chunk_offset);
-
-                        // Only perform this step if there has been a change in chunk
-                        if (force ||
-                            last_sub != sub_chunk_id)
-                        {
-                            // Replace the chunk id with the new one
-                            if (chunk_identifier != nullptr)
-                            {
-                                delete chunk_identifier;
-                            }
-                            chunk_identifier = new std::tuple(c, chunk_id_x, chunk_id_y, chunk_id_z, sub_chunk_id);
-
-                            // Find the start/stop coordinates of this chunk
-                            cxmin = ((size_t)chunk_reader->chunkx) * (x_in_chunk_offset / ((size_t)chunk_reader->chunkx)); // Minimum value of the chunk
-                            cxmax = std::min((size_t)cxmin + chunk_reader->chunkx, (size_t)chunk_reader->sizex);           // Maximum value of the chunk
-                            cxsize = cxmax - cxmin;                                                                        // Size of the chunk
-
-                            cymin = ((size_t)chunk_reader->chunky) * (y_in_chunk_offset / ((size_t)chunk_reader->chunky));
-                            cymax = std::min((size_t)cymin + chunk_reader->chunky, (size_t)chunk_reader->sizey);
-                            cysize = cymax - cymin;
-
-                            czmin = ((size_t)chunk_reader->chunkz) * (z_in_chunk_offset / ((size_t)chunk_reader->chunkz));
-                            czmax = std::min((size_t)czmin + chunk_reader->chunkz, (size_t)chunk_reader->sizez);
-                            czsize = czmax - czmin;
-
-                            if (cxmax <= cxmin || cymax <= cymin || czmax <= czmin)
-                            {
-                                outside_voxels++;
-                                delete chunk_identifier;
-                                chunk_identifier = nullptr;
-                                continue;
-                            }
-
-                            // Check if the chunk is in the tmp cache
-                            region_chunk &cached = chunk_cache[*chunk_identifier];
-                            if (cached.ptr != nullptr && !cached.has_extent(cxmin, cymin, czmin, cxsize, cysize, czsize))
-                            {
-                                // Decoded before a reload in this request changed its extent
-                                free(cached.ptr);
-                                cached.ptr = nullptr;
-                            }
-                            if (cached.ptr == nullptr)
-                            {
-                                cached = region_chunk{chunk_reader->load_chunk(sub_chunk_id, cxsize, cysize, czsize, &failed),
-                                                      cxmin, cymin, czmin, cxsize, cysize, czsize};
-                            }
-                            chunk = cached.ptr;
-
-                            // Store this ID as the most recent chunk
-                            last_sub = sub_chunk_id;
-                            last_c = c;
-                        }
-
-                        if (chunk == nullptr)
-                        {
-                            // Out of memory in load_chunk; read as 0
-                            continue;
-                        }
-
-                        // The chunk was sized before a reload moved this voxel outside it
-                        if (x_in_chunk_offset - cxmin >= cxsize ||
-                            y_in_chunk_offset - cymin >= cysize ||
-                            z_in_chunk_offset - czmin >= czsize)
-                        {
-                            stale_voxels++;
-                            failed = true;
-                            continue;
-                        }
-
-                        // Calculate the coordinates of the input and output inside their respective buffers
-                        const size_t coffset = ((x_in_chunk_offset - cxmin) * cysize * czsize) + // X
-                                               ((y_in_chunk_offset - cymin) * czsize) +          // Y
-                                               (z_in_chunk_offset - czmin);                      // Z
-
-                        const size_t ooffset = ((c - c0) * osizey * osizex * osizez) + // C
-                                               ((k - zs) * osizey * osizex) +          // Z
-                                               ((j - ys) * osizex) +                   // Y
-                                               ((i - xs));                             // X
-
-                        out_buffer[ooffset] = chunk[coffset];
-                    }
-                }
-            }
-        }
-
-        if (chunk_identifier != nullptr)
-        {
-            delete chunk_identifier;
-        }
-
-        for (auto it = chunk_cache.begin(); it != chunk_cache.end(); it++)
-        {
-            free(it->second.ptr);
-        }
-    }
-
     // With failed set, a chunk that cannot be read (the .meta or .data cannot
     // be opened or is short, the data does not decode, memory runs out, the
     // mchunk header is unusable, no reader can be built for its mchunk) sets
@@ -3087,8 +2837,6 @@ public:
         {
             // Voxels that fall outside their stored tile read as 0
             size_t outside_voxels = 0;
-            // Voxels moved outside their chunk by a reload during this request read as 0
-            size_t stale_voxels = 0;
             bool read_failed = false;
 
             // An empty or reversed box reads nothing
@@ -3099,10 +2847,8 @@ public:
                 const size_t mcy = std::max<size_t>(1, mchunky / scale);
                 const size_t mcz = std::max<size_t>(1, mchunkz / scale);
 
-                // Every mchunk the box touches, looked up once each and in the
-                // order the voxel loop first meets them
+                // Every mchunk the box touches, looked up once each
                 std::vector<region_shard> shards;
-                bool header_changed = false;
                 for (size_t c = c0; c < c1; c++)
                 {
                     for (size_t mi = xs / mcx; mi <= (xe - 1) / mcx; mi++)
@@ -3123,9 +2869,12 @@ public:
                                     // opened or has an unusable header
                                     read_failed = true;
                                 }
-                                else if (s.reader->is_valid && s.reader->meta_changed_on_disk())
+                                else if (s.reader->is_valid)
                                 {
-                                    header_changed = true;
+                                    // A header that changed on disk since it was last read (e.g. an
+                                    // alignment moved this tile's crop) is read again now, before any
+                                    // voxel is placed, so the whole request uses the new one
+                                    s.reader->reload_if_modified();
                                 }
                                 shards.push_back(s);
                             }
@@ -3133,24 +2882,8 @@ public:
                     }
                 }
 
-                if (header_changed)
-                {
-                    std::set<std::tuple<size_t, size_t, size_t, size_t, size_t>> back_mchunks;
-                    for (const region_shard &s : shards)
-                    {
-                        if (s.reader == nullptr)
-                        {
-                            back_mchunks.insert({scale, s.c, s.mi, s.mj, s.mk});
-                        }
-                    }
-                    load_region_by_voxel(scale, xs, xe, ys, ye, zs, ze, c0, c1, out_buffer, back_mchunks,
-                                         read_failed, outside_voxels, stale_voxels);
-                }
-                else
-                {
-                    load_region_by_chunk(shards, xs, xe, ys, ye, zs, ze, mcx, mcy, mcz, c0, out_buffer,
-                                         read_failed, outside_voxels);
-                }
+                load_region_by_chunk(shards, xs, xe, ys, ye, zs, ze, mcx, mcy, mcz, c0, out_buffer,
+                                     read_failed, outside_voxels);
             }
 
             std::string note;
@@ -3169,13 +2902,6 @@ public:
                     std::cerr << "Archive geometry is stale: " << metadata_fname << " changed on disk after it was loaded; "
                               << "restart the CDN to serve the new geometry of " << fname << note << std::endl;
                 }
-            }
-
-            if (stale_voxels > 0 && log_limit_stale_extent.allow(note))
-            {
-                std::cerr << "Chunk extent changed during a read: " << stale_voxels << " voxels read as 0 in " << fname
-                          << " scale " << scale << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze
-                          << note << std::endl;
             }
 
             if (failed != nullptr && read_failed)
